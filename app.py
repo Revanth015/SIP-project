@@ -1,14 +1,8 @@
-"""Universal Warehouse Digital Twin — Streamlit application.
-
-The UI is intentionally thin: the warehouse model is orchestrated by
-core.pipeline and the remaining core modules provide visualization/export.
-Run locally with: streamlit run app.py
-"""
+"""Universal Warehouse Digital Twin — Streamlit application."""
 
 from pathlib import Path
 import tempfile
 
-import pandas as pd
 import streamlit as st
 from shapely.geometry import Point
 
@@ -39,6 +33,58 @@ def save_uploaded(upload, suffix):
     tmp.write(upload.getbuffer())
     tmp.close()
     return tmp.name
+
+
+def get_manual_door(cad):
+    """Render a manual door selector; CAD door candidates are reference only."""
+    warehouse = cad["warehouse"]
+    minx, miny, maxx, maxy = warehouse.bounds
+
+    st.info(
+        "The operating door is a user-controlled input. Detected CAD doors are shown "
+        "only as reference; the Digital Twin will not automatically choose one."
+    )
+
+    mode = st.radio(
+        "Door input method",
+        ["Enter coordinates", "Use a detected CAD door as starting point"],
+        horizontal=True,
+        key="door_mode",
+    )
+
+    if mode == "Use a detected CAD door as starting point" and cad.get("doors"):
+        doors = cad["doors"]
+        options = [
+            f"CAD Door {i}: X={d['x']:.3f}, Y={d['y']:.3f} · {d['layer']}"
+            for i, d in enumerate(doors, 1)
+        ]
+        reference = st.selectbox("Reference door", options, key="reference_door")
+        idx = options.index(reference)
+        default_x = float(doors[idx]["x"])
+        default_y = float(doors[idx]["y"])
+    else:
+        default_x = float(warehouse.centroid.x)
+        default_y = float(warehouse.centroid.y)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        door_x = st.number_input(
+            "Operating Door X (m)",
+            min_value=float(minx), max_value=float(maxx),
+            value=float(st.session_state.get("door_x", default_x)),
+            step=0.1, key="door_x",
+            help="Enter the actual X coordinate of the warehouse operating door.",
+        )
+    with c2:
+        door_y = st.number_input(
+            "Operating Door Y (m)",
+            min_value=float(miny), max_value=float(maxy),
+            value=float(st.session_state.get("door_y", default_y)),
+            step=0.1, key="door_y",
+            help="Enter the actual Y coordinate of the warehouse operating door.",
+        )
+
+    return Point(door_x, door_y)
 
 
 with st.sidebar:
@@ -73,10 +119,9 @@ if cad_file:
             st.session_state.cad_path = cad_path
             st.session_state.cad_data = prepare_cad(cad_path)
             st.session_state.cad_preview_key = cad_key
-            # A new file must not retain a door selection from an older CAD.
-            st.session_state.pop("door_choice", None)
-            st.session_state.pop("manual_door_x", None)
-            st.session_state.pop("manual_door_y", None)
+            st.session_state.pop("door_x", None)
+            st.session_state.pop("door_y", None)
+            st.session_state.pop("reference_door", None)
         except Exception as exc:
             st.error(f"CAD could not be read: {exc}")
             st.stop()
@@ -84,45 +129,51 @@ if cad_file:
 if "cad_data" in st.session_state:
     cad = st.session_state.cad_data
     st.subheader("1 · CAD Review")
-    st.caption(f"Detected warehouse layer: **{cad['warehouse_layer']}** · Area: **{cad['warehouse'].area:,.2f} m²**")
+    st.caption(
+        f"Detected warehouse layer: **{cad['warehouse_layer']}** · "
+        f"Area: **{cad['warehouse'].area:,.2f} m²**"
+    )
     st.pyplot(plot_cad_geometry(cad), use_container_width=True)
 
-    doors = cad.get("doors", [])
-    if doors:
-        options = [f"Door {i}: X={d['x']:.3f}, Y={d['y']:.3f} · {d['layer']}" for i, d in enumerate(doors, 1)]
-        choice = st.selectbox("Select the operating door", options, key="door_choice")
-        selected_door_index = options.index(choice)
-        selected_point = doors[selected_door_index]
-        st.caption(f"Selected operating door: ({selected_point['x']:.3f}, {selected_point['y']:.3f})")
-    else:
-        st.warning("No door was detected from the CAD layers. Enter the operating door coordinates manually.")
-        minx, miny, maxx, maxy = cad["warehouse"].bounds
-        c1, c2 = st.columns(2)
-        with c1:
-            door_x = st.number_input("Door X (m)", value=float(cad["warehouse"].centroid.x), key="manual_door_x")
-        with c2:
-            door_y = st.number_input("Door Y (m)", value=float(cad["warehouse"].centroid.y), key="manual_door_y")
-        selected_point = {"x": door_x, "y": door_y, "layer": "MANUAL"}
+    st.subheader("2 · Fix Operating Door")
+    selected_door = get_manual_door(cad)
+    st.session_state.selected_door = selected_door
+
+    # A separate coordinate marker makes the user-selected point visually explicit.
+    st.pyplot(
+        plot_cad_geometry({
+            **cad,
+            "doors": [{
+                "x": selected_door.x,
+                "y": selected_door.y,
+                "layer": "USER_SELECTED",
+            }],
+        }),
+        use_container_width=True,
+    )
+    st.caption(
+        f"**Operating door fixed at:** X = {selected_door.x:.3f} m, "
+        f"Y = {selected_door.y:.3f} m"
+    )
 
 
 if run:
     if "cad_path" not in st.session_state or not demand_file:
         st.error("Upload both a warehouse DXF and a daily demand file before running the Digital Twin.")
         st.stop()
+    if "selected_door" not in st.session_state:
+        st.error("Set the operating door coordinates before running the Digital Twin.")
+        st.stop()
 
     try:
         demand_path = save_uploaded(demand_file, Path(demand_file.name).suffix.lower())
-        manual_xy = None
-        if not st.session_state.cad_data.get("doors"):
-            manual_xy = (selected_point["x"], selected_point["y"])
-        else:
-            manual_xy = (selected_point["x"], selected_point["y"])
+        selected_door = st.session_state.selected_door
 
         with st.spinner("Running CAD → layout → capacity → simulation pipeline..."):
             result = run_pipeline(
                 st.session_state.cad_path,
                 demand_path,
-                manual_door_xy=manual_xy,
+                manual_door_xy=(selected_door.x, selected_door.y),
                 pallet_width_m=pallet_width,
                 pallet_depth_m=pallet_depth,
                 wall_clearance_m=wall_clearance,
@@ -143,6 +194,8 @@ if run:
             "target_occupancy_pct": occupancy,
             "forklift_speed_mps": forklift_speed,
             "handling_time_sec_per_pallet": handling_time,
+            "operating_door_x_m": selected_door.x,
+            "operating_door_y_m": selected_door.y,
         }
         st.session_state.result = result
         st.success("Digital Twin calculation completed.")
@@ -154,7 +207,7 @@ if run:
 if "result" in st.session_state:
     r = st.session_state.result
     st.divider()
-    st.subheader("2 · Decision Dashboard")
+    st.subheader("3 · Decision Dashboard")
     cap = r["capacity"]
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Theoretical Capacity", f"{cap['theoretical_capacity']:,}")
@@ -163,7 +216,7 @@ if "result" in st.session_state:
     c4.metric("Planning Occupancy", f"{cap['planning_occupancy_pct']:.0f}%")
     st.dataframe(r["capacity_table"], use_container_width=True, hide_index=True)
 
-    st.subheader("3 · Optimized Layout")
+    st.subheader("4 · Optimized Layout")
     st.pyplot(plot_layout(
         r["warehouse"], r["storage_region"], r["slots"], r["door"],
         r["winner"]["layout"]["main_aisle"], r["winner"]["layout"]["turning_circle"],
@@ -176,7 +229,7 @@ if "result" in st.session_state:
     m3.metric("Detected Obstacles", f"{len(r['obstacles'])}")
     m4.metric("Peak Demand", f"{r['demand_metrics']['peak_demand']:.0f}")
 
-    st.subheader("4 · Daily Simulation")
+    st.subheader("5 · Daily Simulation")
     st.dataframe(r["daily_df"], use_container_width=True, hide_index=True)
     s = r["simulation_summary"]
     a1, a2, a3, a4 = st.columns(4)
@@ -185,13 +238,13 @@ if "result" in st.session_state:
     a3.metric("Avg Fatigue Proxy", f"{s['average_fatigue']:.2f}")
     a4.metric("Overflow Days", f"{s['overflow_days']}")
 
-    st.subheader("5 · Slot Distance Reference")
+    st.subheader("6 · Slot Distance Reference")
     st.dataframe(r["slot_df"], use_container_width=True, hide_index=True)
 
-    st.subheader("6 · Layout Search")
+    st.subheader("7 · Layout Search")
     st.dataframe(r["search_df"], use_container_width=True, hide_index=True)
 
-    st.subheader("7 · Downloads")
+    st.subheader("8 · Downloads")
     out = Path(tempfile.mkdtemp())
     excel_path = out / "Universal_Warehouse_Digital_Twin.xlsx"
     kpi = build_kpi_table(r["capacity"], r["demand_metrics"], r["simulation_summary"], r["winner"])
