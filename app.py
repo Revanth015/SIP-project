@@ -9,13 +9,12 @@ from shapely.geometry import Point
 from core.pipeline import run_pipeline, prepare_cad
 from core.visualization_engine import plot_cad_geometry, plot_layout, create_daily_gif
 from core.export_engine import build_kpi_table, export_excel
-from core.process_engine import (
-    ProcessModelConfig,
-    simulate_process_model,
-    process_summary,
-    process_kpi_table,
-    storage_paradox_table,
-    scenario_sensitivity,
+from core.mto_actual_engine import (
+    ActualMTOConfig,
+    prepare_actual_mto,
+    simulate_actual_mto,
+    build_actual_kpi_table,
+    build_storage_paradox_actual,
 )
 
 st.set_page_config(page_title="Universal Warehouse Digital Twin", page_icon="🏭", layout="wide", initial_sidebar_state="expanded")
@@ -138,7 +137,7 @@ if run:
 
 if "result" in st.session_state:
     r = st.session_state.result
-    tabs = st.tabs(["Model 1 · Warehouse Layout", "Model 2 · MTO Process", "Downloads"])
+    tabs = st.tabs(["Model 1 · Warehouse Layout", "Model 2 · Actual MTO Process", "Downloads"])
 
     with tabs[0]:
         st.subheader("Model 1 · Warehouse Layout Digital Twin")
@@ -170,157 +169,137 @@ if "result" in st.session_state:
         st.dataframe(r["search_df"], use_container_width=True, hide_index=True)
 
     with tabs[1]:
-        st.subheader("Model 2 · MTO Process Change Digital Twin")
-        st.markdown("**Current:** Picking → loose/mixed packing → temporary WIP → retrieval/rehandling → dispatch")
-        st.markdown("**Proposed:** Picking → single-SKU stick packing → temporary staging → dispatch/consolidation")
-        st.caption("Daily pallet demand is used as the process-volume proxy when detailed order-level MTO data are not supplied. All scenario assumptions below are editable.")
+        st.subheader("Model 2 · Actual SKU-Level MTO Process Digital Twin")
+        st.markdown("**Current:** Pick belts → count/pack → temporary WIP → retrieve/rehandle → dispatch")
+        st.markdown("**Proposed:** Pick MTO belts → single-SKU stick pack → temporary staging → later same-SKU completion → dispatch")
+        st.info("Model 2 now uses the actual MTO transaction data. It does not convert pallets into synthetic MTO orders. For the box master: positive values are used; zero values and missing values use the default 28 belts/box; conflicting positive values are flagged and use the default 28 for the scenario.")
 
-        defaults = ProcessModelConfig()
-        with st.expander("⚙ Model 2 assumptions — change these to run what-if scenarios", expanded=True):
-            st.markdown("**A. Demand & box logic**")
+        mto_upload = st.file_uploader("Upload actual MTO packing-list master (.xlsx)", type=["xlsx"], key="model2_mto")
+        box_upload = st.file_uploader("Upload Size / Box Master (.xlsx)", type=["xlsx"], key="model2_box")
+
+        cfg0 = ActualMTOConfig()
+        with st.expander("⚙ Model 2 editable assumptions", expanded=True):
             a1, a2, a3, a4 = st.columns(4)
             with a1:
-                mto_share = st.number_input("MTO share (%)", 0.0, 100.0, float(defaults.mto_share_pct), 1.0)
+                default_box = st.number_input("Default belts / box", 1.0, 10000.0, float(cfg0.default_box_qty), 1.0, help="Used when the master has no usable positive value, including zero or no match.")
             with a2:
-                box_qty = st.number_input("Standard box quantity", 1.0, 10000.0, float(defaults.standard_box_qty), 1.0)
+                conflict_box = st.number_input("Conflict fallback / box", 1.0, 10000.0, float(cfg0.conflict_box_qty), 1.0)
             with a3:
-                belts_order = st.number_input("Avg belts / MTO order", 0.1, 10000.0, float(defaults.average_belts_per_mto_order), 0.5)
+                box_area = st.number_input("Box footprint (m²)", 0.001, 100.0, float(cfg0.box_footprint_m2), 0.01)
             with a4:
-                partial_rate = st.slider("Partial-box rate (%)", 0, 100, int(defaults.partial_box_rate_pct))
+                wip_multiplier = st.number_input("WIP location multiplier", 0.1, 10.0, float(cfg0.wip_location_multiplier), 0.1)
 
-            st.markdown("**B. Current vs proposed process**")
+            st.markdown("**Current vs proposed process parameters**")
             b1, b2, b3, b4 = st.columns(4)
             with b1:
-                current_touches = st.number_input("Current touches / box", 0.1, 100.0, float(defaults.current_touches_per_box), 0.5)
-                cur_pack = st.number_input("Current pack time (sec)", 0.0, 3600.0, float(defaults.current_pack_time_sec), 5.0)
+                cur_touch = st.number_input("Current touches / box", 0.1, 100.0, float(cfg0.current_touches_per_box), 0.5)
+                cur_pack = st.number_input("Current pack (sec)", 0.0, 3600.0, float(cfg0.current_pack_time_sec), 5.0)
             with b2:
-                proposed_touches = st.number_input("Proposed touches / box", 0.1, 100.0, float(defaults.proposed_touches_per_box), 0.5)
-                prop_pack = st.number_input("Proposed pack time (sec)", 0.0, 3600.0, float(defaults.proposed_pack_time_sec), 5.0)
+                prop_touch = st.number_input("Proposed touches / box", 0.1, 100.0, float(cfg0.proposed_touches_per_box), 0.5)
+                prop_pack = st.number_input("Proposed pack (sec)", 0.0, 3600.0, float(cfg0.proposed_pack_time_sec), 5.0)
             with b3:
-                cur_count = st.number_input("Current count time (sec)", 0.0, 3600.0, float(defaults.current_count_time_sec), 5.0)
-                prop_count = st.number_input("Proposed count time (sec)", 0.0, 3600.0, float(defaults.proposed_count_time_sec), 5.0)
+                cur_count = st.number_input("Current count (sec)", 0.0, 3600.0, float(cfg0.current_count_time_sec), 5.0)
+                prop_count = st.number_input("Proposed count (sec)", 0.0, 3600.0, float(cfg0.proposed_count_time_sec), 5.0)
             with b4:
-                error_prob = st.number_input("Error probability / touch (%)", 0.0, 100.0, float(defaults.error_probability_per_touch_pct), 0.1)
-                box_area = st.number_input("Box footprint (m²)", 0.001, 100.0, float(defaults.box_footprint_m2), 0.01)
+                err_prob = st.number_input("Error probability / touch (%)", 0.0, 100.0, float(cfg0.error_probability_per_touch_pct), 0.1)
+                fat_touch = st.number_input("Fatigue points / touch", 0.0, 100.0, float(cfg0.fatigue_points_per_touch), 0.1)
 
-            st.markdown("**C. WIP & temporary storage behaviour**")
+            st.markdown("**WIP handling and automation**")
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                cur_store = st.number_input("Current WIP store (sec)", 0.0, 3600.0, float(defaults.current_wip_store_time_sec), 5.0)
-                cur_ret = st.number_input("Current WIP retrieve (sec)", 0.0, 3600.0, float(defaults.current_wip_retrieve_time_sec), 5.0)
+                cur_store = st.number_input("Current WIP store (sec)", 0.0, 3600.0, float(cfg0.current_store_time_sec), 5.0)
+                cur_ret = st.number_input("Current WIP retrieve (sec)", 0.0, 3600.0, float(cfg0.current_retrieve_time_sec), 5.0)
             with c2:
-                prop_store = st.number_input("Proposed WIP store (sec)", 0.0, 3600.0, float(defaults.proposed_wip_store_time_sec), 5.0)
-                prop_ret = st.number_input("Proposed WIP retrieve (sec)", 0.0, 3600.0, float(defaults.proposed_wip_retrieve_time_sec), 5.0)
+                prop_store = st.number_input("Proposed WIP store (sec)", 0.0, 3600.0, float(cfg0.proposed_store_time_sec), 5.0)
+                prop_ret = st.number_input("Proposed WIP retrieve (sec)", 0.0, 3600.0, float(cfg0.proposed_retrieve_time_sec), 5.0)
             with c3:
-                cur_dwell = st.number_input("Current WIP dwell (days)", 0.0, 365.0, float(defaults.current_wip_dwell_days), 0.5)
-                prop_dwell = st.number_input("Proposed WIP dwell (days)", 0.0, 365.0, float(defaults.proposed_wip_dwell_days), 0.5)
+                fat_wip = st.number_input("Fatigue points / WIP cycle", 0.0, 100.0, float(cfg0.fatigue_points_per_wip_cycle), 0.1)
+                automation = st.slider("Automation coverage (%)", 0, 100, int(cfg0.automation_coverage_pct))
             with c4:
-                wip_reduction = st.slider("Target WIP reduction (%)", 0, 100, int(defaults.target_wip_reduction_pct))
-                max_wip = st.number_input("Maximum temporary WIP boxes", 1.0, 100000.0, float(defaults.max_temporary_wip_boxes), 10.0)
+                auto_time = st.slider("Automation time reduction (%)", 0, 100, int(cfg0.automation_time_reduction_pct))
+                auto_touch = st.slider("Automation touch reduction (%)", 0, 100, int(cfg0.automation_touch_reduction_pct))
 
-            st.markdown("**D. Proxy & automation assumptions**")
-            d1, d2, d3, d4 = st.columns(4)
-            with d1:
-                fatigue_touch = st.number_input("Fatigue points / touch", 0.0, 100.0, float(defaults.fatigue_points_per_touch), 0.1)
-                fatigue_wip = st.number_input("Fatigue points / WIP cycle", 0.0, 100.0, float(defaults.fatigue_points_per_wip_cycle), 0.1)
-            with d2:
-                automation = st.slider("Automation coverage (%)", 0, 100, int(defaults.automation_coverage_pct))
-            with d3:
-                auto_time = st.slider("Automation time reduction (%)", 0, 100, int(defaults.automation_time_reduction_pct))
-            with d4:
-                auto_touch = st.slider("Automation touch reduction (%)", 0, 100, int(defaults.automation_touch_reduction_pct))
+            st.markdown("**Storage baseline (editable only when you have a measured current WIP baseline)**")
+            s1, s2 = st.columns(2)
+            with s1:
+                current_shared = st.number_input("Current shared storage slots", 0.0, 100000.0, 1913.0, 1.0)
+            with s2:
+                current_wip = st.number_input("Measured current temporary-WIP slots", 0.0, 100000.0, 0.0, 1.0, help="Leave 0 if no measured current WIP baseline is available. The actual model will not invent one.")
 
-            st.markdown("**E. Storage paradox assumptions**")
-            e1, e2, e3 = st.columns(3)
-            with e1:
-                shared_slots = st.number_input("Current shared storage slots", 1.0, 100000.0, float(defaults.current_shared_storage_slots), 1.0)
-            with e2:
-                current_wip_slots = st.number_input("Current temporary WIP slots", 0.0, 100000.0, float(defaults.current_temporary_wip_slots), 1.0)
-            with e3:
-                density_penalty = st.number_input("Density / staging penalty slots", 0.0, 100000.0, float(defaults.density_staging_penalty_slots), 1.0)
-            st.caption("Storage logic: Proposed shared storage = Current shared storage − WIP reduction effect + density/staging penalty. Negative net change means storage is released; positive means storage is consumed.")
+        if mto_upload and box_upload:
+            try:
+                mto_path = save_uploaded(mto_upload, ".xlsx")
+                box_path = save_uploaded(box_upload, ".xlsx")
+                cfg = ActualMTOConfig(
+                    default_box_qty=default_box, conflict_box_qty=conflict_box,
+                    current_touches_per_box=cur_touch, proposed_touches_per_box=prop_touch,
+                    current_pack_time_sec=cur_pack, proposed_pack_time_sec=prop_pack,
+                    current_count_time_sec=cur_count, proposed_count_time_sec=prop_count,
+                    current_store_time_sec=cur_store, proposed_store_time_sec=prop_store,
+                    current_retrieve_time_sec=cur_ret, proposed_retrieve_time_sec=prop_ret,
+                    error_probability_per_touch_pct=err_prob,
+                    fatigue_points_per_touch=fat_touch, fatigue_points_per_wip_cycle=fat_wip,
+                    automation_coverage_pct=automation, automation_time_reduction_pct=auto_time,
+                    automation_touch_reduction_pct=auto_touch, box_footprint_m2=box_area,
+                    wip_location_multiplier=wip_multiplier,
+                )
+                detail, master = prepare_actual_mto(mto_path, box_path, cfg)
+                daily2, wip_detail, summary = simulate_actual_mto(detail, cfg)
+                st.session_state.model2_actual = {"detail": detail, "master": master, "daily": daily2, "wip_detail": wip_detail, "summary": summary, "config": cfg}
 
-        cfg = ProcessModelConfig(
-            mto_share_pct=mto_share, standard_box_qty=box_qty, average_belts_per_mto_order=belts_order,
-            partial_box_rate_pct=partial_rate, current_touches_per_box=current_touches,
-            proposed_touches_per_box=proposed_touches, error_probability_per_touch_pct=error_prob,
-            current_pack_time_sec=cur_pack, proposed_pack_time_sec=prop_pack,
-            current_count_time_sec=cur_count, proposed_count_time_sec=prop_count,
-            current_wip_store_time_sec=cur_store, proposed_wip_store_time_sec=prop_store,
-            current_wip_retrieve_time_sec=cur_ret, proposed_wip_retrieve_time_sec=prop_ret,
-            current_wip_dwell_days=cur_dwell, proposed_wip_dwell_days=prop_dwell,
-            target_wip_reduction_pct=wip_reduction, max_temporary_wip_boxes=max_wip,
-            fatigue_points_per_touch=fatigue_touch, fatigue_points_per_wip_cycle=fatigue_wip,
-            automation_coverage_pct=automation, automation_time_reduction_pct=auto_time,
-            automation_touch_reduction_pct=auto_touch, box_footprint_m2=box_area,
-            current_shared_storage_slots=shared_slots, current_temporary_wip_slots=current_wip_slots,
-            density_staging_penalty_slots=density_penalty,
-        )
+                st.success(f"Actual MTO model completed: {len(detail):,} transaction rows processed.")
+                st.markdown("### Model 2 Executive Dashboard")
+                k = st.columns(6)
+                k[0].metric("Processing Time", f"{summary['time_reduction_pct']:.1f}% ↓")
+                k[1].metric("Manual Touches", f"{summary['touch_reduction_pct']:.1f}% ↓")
+                k[2].metric("Fatigue Proxy", f"{summary['fatigue_reduction_pct']:.1f}% ↓")
+                k[3].metric("Error-Risk Proxy", f"{summary['error_risk_reduction_pct']:.1f}% ↓")
+                k[4].metric("Peak Temporary WIP", f"{summary['peak_closing_wip_boxes']:.0f} boxes")
+                k[5].metric("Final Open WIP", f"{summary['final_open_wip_boxes']:.0f} boxes")
 
-        try:
-            p2 = simulate_process_model(r["demand"], cfg)
-            ps = process_summary(p2)
-            st.session_state.process_result = p2
-            st.session_state.process_config = cfg
+                st.markdown("### 1 · Data / Box Conversion Validation")
+                q = st.columns(5)
+                q[0].metric("MTO Transactions", f"{summary['transactions']:,}")
+                q[1].metric("Master Standard Rows", f"{summary['master_standard_rows']:,}")
+                q[2].metric("Default — Missing", f"{summary['default_missing_rows']:,}")
+                q[3].metric("Default — Zero", f"{summary['default_zero_rows']:,}")
+                q[4].metric("Conflicting Standards", f"{summary['default_conflict_rows']:,}")
+                st.dataframe(detail.head(500), use_container_width=True, hide_index=True)
+                st.caption("The table is limited to the first 500 transaction rows on screen; the full transaction-level table is included in the Excel export.")
 
-            st.markdown("### Model 2 Executive Dashboard")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Processing Time", f"{ps['time_reduction_pct']:.1f}% ↓")
-            k2.metric("Manual Touches", f"{ps['touch_reduction_pct']:.1f}% ↓")
-            k3.metric("Fatigue Proxy", f"{ps['fatigue_reduction_pct']:.1f}% ↓")
-            k4.metric("Expected Error Proxy", f"{ps['error_proxy_reduction_pct']:.1f}% ↓")
-            k5, k6, k7, k8 = st.columns(4)
-            k5.metric("Temporary WIP", f"{ps['wip_reduction_pct']:.1f}% ↓")
-            k6.metric("Current Shared Storage", f"{ps['current_shared_storage_slots']:,.0f} slots")
-            k7.metric("Proposed Shared Storage", f"{ps['proposed_shared_storage_slots']:,.0f} slots")
-            k8.metric("Net Storage Change", f"{ps['net_shared_storage_change_slots']:+,.0f} slots")
+                st.markdown("### 2 · Process KPI Comparison")
+                st.dataframe(build_actual_kpi_table(summary), use_container_width=True, hide_index=True)
 
-            st.markdown("### 1 · Process KPI Comparison")
-            st.dataframe(process_kpi_table(ps), use_container_width=True, hide_index=True)
+                st.markdown("### 3 · Actual SKU-Level WIP Simulation")
+                if not daily2.empty:
+                    chart = daily2.set_index("DATE")[["OPENING_WIP_BOXES", "CLOSING_WIP_BOXES"]]
+                    st.line_chart(chart)
+                    st.caption(f"Average closing WIP: {summary['average_closing_wip_boxes']:.2f} boxes · Peak closing WIP: {summary['peak_closing_wip_boxes']:.0f} boxes · Peak WIP storage: {summary['peak_closing_wip_storage_m2']:.2f} m²")
+                    st.dataframe(daily2, use_container_width=True, hide_index=True)
 
-            st.markdown("### 2 · Temporary WIP Simulation")
-            chart_df = p2.set_index("DATE")[["CURRENT_WIP_BOXES", "PROPOSED_WIP_BOXES"]]
-            st.line_chart(chart_df)
-            st.caption(f"Average current WIP: {ps['average_current_wip_boxes']:.2f} boxes · Average proposed WIP: {ps['average_proposed_wip_boxes']:.2f} boxes · Peak proposed WIP: {ps['peak_proposed_wip_boxes']:.2f} boxes")
+                st.markdown("### 4 · Storage Paradox")
+                st.dataframe(build_storage_paradox_actual(summary, box_area), use_container_width=True, hide_index=True)
+                st.info("Positive storage change means additional temporary staging is required. A measured current-WIP baseline can be entered above to convert this into a true current-vs-proposed net storage comparison.")
 
-            st.markdown("### 3 · Storage Paradox")
-            left, right = st.columns([1, 1.4])
-            with left:
-                st.metric("WIP reduction effect", f"-{ps['wip_reduction_effect_slots']:.1f} slots")
-                st.metric("Density / staging penalty", f"+{ps['density_staging_penalty_slots']:.1f} slots")
-                st.metric("NET STORAGE CHANGE", f"{ps['net_shared_storage_change_slots']:+.1f} slots")
-                st.caption("The proposed process can improve handling while the single-SKU storage rule can create a density penalty. The model makes both effects visible rather than hiding the trade-off.")
-            with right:
-                st.dataframe(storage_paradox_table(ps), use_container_width=True, hide_index=True)
+                st.markdown("### 5 · Open WIP by SKU")
+                if wip_detail.empty:
+                    st.success("No SKU-level closing WIP remains at the end of the supplied period.")
+                else:
+                    st.dataframe(wip_detail, use_container_width=True, hide_index=True)
 
-            st.markdown("### 4 · Automation & Sensitivity What-If")
-            st.caption("Change automation coverage or another scenario variable to see how the decision changes.")
-            sens_parameter = st.selectbox(
-                "Sensitivity variable",
-                ["mto_share_pct", "target_wip_reduction_pct", "automation_coverage_pct", "standard_box_qty", "partial_box_rate_pct"],
-                format_func=lambda x: {
-                    "mto_share_pct": "MTO share (%)",
-                    "target_wip_reduction_pct": "Target WIP reduction (%)",
-                    "automation_coverage_pct": "Automation coverage (%)",
-                    "standard_box_qty": "Standard box quantity",
-                    "partial_box_rate_pct": "Partial-box rate (%)",
-                }[x],
-            )
-            if sens_parameter in {"mto_share_pct", "target_wip_reduction_pct", "automation_coverage_pct", "partial_box_rate_pct"}:
-                sens_range = st.slider("Sensitivity range", 0, 100, (20, 80), 5, key=f"sens_{sens_parameter}")
-                values = list(range(sens_range[0], sens_range[1] + 1, 5))
-            else:
-                sens_range = st.slider("Box quantity range", 1, 100, (5, 20), 1, key="sens_box_qty")
-                values = list(range(sens_range[0], sens_range[1] + 1))
-            sensitivity_df = scenario_sensitivity(r["demand"], cfg, sens_parameter, values)
-            st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
-            st.line_chart(sensitivity_df.set_index("SCENARIO_VALUE")[["TIME_REDUCTION_%", "WIP_REDUCTION_%", "NET_STORAGE_CHANGE_%"]])
-
-            st.markdown("### 5 · Daily Model 2 Results")
-            st.dataframe(p2, use_container_width=True, hide_index=True)
-            st.caption("Interpretation: fatigue is a relative proxy; expected errors are modelled risk estimates; WIP reduction depends on the stated process assumptions; storage figures are scenario outputs.")
-        except Exception as e:
-            st.error(f"Model 2 could not be calculated: {e}")
+                st.markdown("### 6 · Data Quality / Assumption Summary")
+                st.write({
+                    "Default box quantity used": default_box,
+                    "Non-integer quantity rows": summary["non_integer_rows"],
+                    "Default due to missing master": summary["default_missing_rows"],
+                    "Default due to zero/invalid master": summary["default_zero_rows"],
+                    "Default due to conflicting positive standards": summary["default_conflict_rows"],
+                    "Interpretation": "Fatigue and error are proxies; WIP and storage are modelled from actual SKU-level transactions and the stated box-standard rules.",
+                })
+            except Exception as e:
+                st.error(f"Actual MTO Model 2 could not be calculated: {e}")
+        else:
+            st.warning("Upload both the actual MTO packing-list master and the Size / Box Master to run Model 2.")
 
     with tabs[2]:
         st.subheader("Downloads")
@@ -330,15 +309,17 @@ if "result" in st.session_state:
         export_excel(excel_path, kpi, r["capacity_table"], r["daily_df"], r["occupancy_df"], r["slot_df"], r["search_df"], r["config"], r["demand_metrics"])
         st.download_button("⬇ Download Model 1 Excel", data=excel_path.read_bytes(), file_name=excel_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        if "process_result" in st.session_state and not st.session_state.process_result.empty:
-            p2 = st.session_state.process_result
-            p2_path = out / "Model_2_MTO_Process_Analysis.xlsx"
-            ps2 = process_summary(p2)
+        if "model2_actual" in st.session_state:
+            m2 = st.session_state.model2_actual
+            p2_path = out / "Model_2_Actual_MTO_Analysis.xlsx"
             with pd.ExcelWriter(p2_path, engine="openpyxl") as writer:
-                p2.to_excel(writer, sheet_name="Daily_Model_2", index=False)
-                process_kpi_table(ps2).to_excel(writer, sheet_name="Process_KPIs", index=False)
-                storage_paradox_table(ps2).to_excel(writer, sheet_name="Storage_Paradox", index=False)
-            st.download_button("⬇ Download Model 2 Excel", data=p2_path.read_bytes(), file_name=p2_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                build_actual_kpi_table(m2["summary"]).to_excel(writer, sheet_name="Process_KPIs", index=False)
+                m2["daily"].to_excel(writer, sheet_name="Daily_WIP", index=False)
+                m2["wip_detail"].to_excel(writer, sheet_name="Open_WIP_by_SKU", index=False)
+                m2["detail"].to_excel(writer, sheet_name="Transaction_Box_Detail", index=False)
+                m2["master"].to_excel(writer, sheet_name="Box_Master_Cleaned", index=False)
+                build_storage_paradox_actual(m2["summary"], m2["config"].box_footprint_m2).to_excel(writer, sheet_name="Storage_Paradox", index=False)
+            st.download_button("⬇ Download Model 2 Actual MTO Excel", data=p2_path.read_bytes(), file_name=p2_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         if st.button("🎞 Generate Daily Simulation GIF"):
             gif_path = out / "Daily_Warehouse_Simulation.gif"
