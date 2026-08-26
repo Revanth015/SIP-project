@@ -15,13 +15,10 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class ProcessModelConfig:
-    # Demand / box logic
     mto_share_pct: float = 30.0
     standard_box_qty: float = 10.0
     average_belts_per_mto_order: float = 6.0
     partial_box_rate_pct: float = 50.0
-
-    # Current vs proposed manual work
     current_touches_per_box: float = 4.0
     proposed_touches_per_box: float = 2.0
     current_pack_time_sec: float = 40.0
@@ -32,29 +29,24 @@ class ProcessModelConfig:
     proposed_wip_store_time_sec: float = 35.0
     current_wip_retrieve_time_sec: float = 90.0
     proposed_wip_retrieve_time_sec: float = 45.0
-
-    # WIP behaviour
     current_wip_dwell_days: float = 3.0
     proposed_wip_dwell_days: float = 2.0
     target_wip_reduction_pct: float = 65.0
     max_temporary_wip_boxes: float = 500.0
-
-    # Proxy assumptions
     error_probability_per_touch_pct: float = 1.5
     fatigue_points_per_touch: float = 1.0
     fatigue_points_per_wip_cycle: float = 2.5
-
-    # Automation scenario
     automation_coverage_pct: float = 0.0
     automation_time_reduction_pct: float = 20.0
     automation_touch_reduction_pct: float = 20.0
     automation_wip_bonus_pct: float = 5.0
-
-    # Storage paradox
     box_footprint_m2: float = 0.25
     boxes_per_pallet: float = 32.0
+    # Baseline storage scenario is calibrated to the SIP presentation:
+    # 1,913 current shared slots, ~82 slots released at 65% WIP reduction,
+    # +2-slot density/staging penalty => ~1,833 proposed / -80 net slots.
     current_shared_storage_slots: float = 1913.0
-    current_temporary_wip_slots: float = 82.0
+    current_temporary_wip_slots: float = 126.15
     density_staging_penalty_slots: float = 2.0
 
     def validate(self):
@@ -68,24 +60,20 @@ class ProcessModelConfig:
             value = getattr(self, name)
             if not 0 <= value <= 100:
                 raise ValueError(f"{name} must be between 0 and 100%.")
-
         positive_fields = (
             "standard_box_qty", "average_belts_per_mto_order", "current_touches_per_box",
             "proposed_touches_per_box", "current_pack_time_sec", "proposed_pack_time_sec",
             "current_count_time_sec", "proposed_count_time_sec", "current_wip_store_time_sec",
             "proposed_wip_store_time_sec", "current_wip_retrieve_time_sec",
             "proposed_wip_retrieve_time_sec", "box_footprint_m2", "boxes_per_pallet",
-            "current_shared_storage_slots", "current_temporary_wip_slots",
-            "max_temporary_wip_boxes",
+            "current_shared_storage_slots", "current_temporary_wip_slots", "max_temporary_wip_boxes",
         )
         for name in positive_fields:
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be greater than zero.")
-
         nonnegative_fields = (
             "current_wip_dwell_days", "proposed_wip_dwell_days",
-            "fatigue_points_per_touch", "fatigue_points_per_wip_cycle",
-            "density_staging_penalty_slots",
+            "fatigue_points_per_touch", "fatigue_points_per_wip_cycle", "density_staging_penalty_slots",
         )
         for name in nonnegative_fields:
             if getattr(self, name) < 0:
@@ -93,17 +81,10 @@ class ProcessModelConfig:
 
 
 def normalize_process_demand(demand_df: pd.DataFrame):
-    """Normalize daily demand for Model 2.
-
-    Current implementation accepts DATE + TOTAL_PALLETS/PALLETS/DEMAND.
-    Daily pallet demand is explicitly treated as a process-volume proxy when
-    detailed order-level MTO records are not supplied.
-    """
+    """Normalize daily demand; daily pallets are a process-volume proxy."""
     df = demand_df.copy()
     date_col = next((c for c in df.columns if str(c).upper() in {"DATE", "DATETIME", "DAY"}), None)
-    qty_col = next((c for c in df.columns if str(c).upper() in {
-        "TOTAL_PALLETS", "PALLETS", "DEMAND", "DAILY_DEMAND"
-    }), None)
+    qty_col = next((c for c in df.columns if str(c).upper() in {"TOTAL_PALLETS", "PALLETS", "DEMAND", "DAILY_DEMAND"}), None)
     if date_col is None or qty_col is None:
         raise ValueError("Model 2 demand needs DATE and TOTAL_PALLETS/PALLETS/DEMAND.")
     df = df.rename(columns={date_col: "DATE", qty_col: "TOTAL_PALLETS"})
@@ -111,10 +92,6 @@ def normalize_process_demand(demand_df: pd.DataFrame):
     df["TOTAL_PALLETS"] = pd.to_numeric(df["TOTAL_PALLETS"], errors="coerce")
     df = df.dropna(subset=["DATE", "TOTAL_PALLETS"])
     return df.groupby("DATE", as_index=False)["TOTAL_PALLETS"].sum().sort_values("DATE")
-
-
-def _box_count(belts, box_qty):
-    return int(math.ceil(max(float(belts), 0.0) / box_qty))
 
 
 def _automation_blend(base_value, automation_value, coverage_pct):
@@ -129,49 +106,17 @@ def estimate_process_day(pallets, cfg: ProcessModelConfig):
     remainder = mto_belts % cfg.standard_box_qty
     partial_boxes = 1 if remainder > 1e-9 else 0
     current_boxes = full_boxes + partial_boxes
-
-    # Proposed process keeps one SKU/partial quantity in one temporary box.
-    # The configurable partial-box rate represents how often that temporary
-    # condition occurs in the scenario.
     proposed_initial_wip_boxes = partial_boxes * cfg.partial_box_rate_pct / 100.0
     proposed_boxes = full_boxes + proposed_initial_wip_boxes
 
-    coverage = cfg.automation_coverage_pct / 100.0
-    proposed_pack_time = _automation_blend(
-        cfg.proposed_pack_time_sec,
-        cfg.proposed_pack_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0),
-        cfg.automation_coverage_pct,
-    )
-    proposed_count_time = _automation_blend(
-        cfg.proposed_count_time_sec,
-        cfg.proposed_count_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0),
-        cfg.automation_coverage_pct,
-    )
-    proposed_store_time = _automation_blend(
-        cfg.proposed_wip_store_time_sec,
-        cfg.proposed_wip_store_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0),
-        cfg.automation_coverage_pct,
-    )
-    proposed_retrieve_time = _automation_blend(
-        cfg.proposed_wip_retrieve_time_sec,
-        cfg.proposed_wip_retrieve_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0),
-        cfg.automation_coverage_pct,
-    )
-    proposed_touches_per_box = _automation_blend(
-        cfg.proposed_touches_per_box,
-        cfg.proposed_touches_per_box * (1 - cfg.automation_touch_reduction_pct / 100.0),
-        cfg.automation_coverage_pct,
-    )
+    proposed_pack_time = _automation_blend(cfg.proposed_pack_time_sec, cfg.proposed_pack_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0), cfg.automation_coverage_pct)
+    proposed_count_time = _automation_blend(cfg.proposed_count_time_sec, cfg.proposed_count_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0), cfg.automation_coverage_pct)
+    proposed_store_time = _automation_blend(cfg.proposed_wip_store_time_sec, cfg.proposed_wip_store_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0), cfg.automation_coverage_pct)
+    proposed_retrieve_time = _automation_blend(cfg.proposed_wip_retrieve_time_sec, cfg.proposed_wip_retrieve_time_sec * (1 - cfg.automation_time_reduction_pct / 100.0), cfg.automation_coverage_pct)
+    proposed_touches_per_box = _automation_blend(cfg.proposed_touches_per_box, cfg.proposed_touches_per_box * (1 - cfg.automation_touch_reduction_pct / 100.0), cfg.automation_coverage_pct)
 
-    current_time = current_boxes * (
-        cfg.current_pack_time_sec + cfg.current_count_time_sec
-        + cfg.current_wip_store_time_sec + cfg.current_wip_retrieve_time_sec
-    )
-    proposed_time = proposed_boxes * (
-        proposed_pack_time + proposed_count_time
-        + proposed_store_time + proposed_retrieve_time
-    )
-
+    current_time = current_boxes * (cfg.current_pack_time_sec + cfg.current_count_time_sec + cfg.current_wip_store_time_sec + cfg.current_wip_retrieve_time_sec)
+    proposed_time = proposed_boxes * (proposed_pack_time + proposed_count_time + proposed_store_time + proposed_retrieve_time)
     current_touches = current_boxes * cfg.current_touches_per_box
     proposed_touches = proposed_boxes * proposed_touches_per_box
 
@@ -179,15 +124,8 @@ def estimate_process_day(pallets, cfg: ProcessModelConfig):
     current_error_risk = 100.0 * (1.0 - (1.0 - p) ** max(current_touches, 0.0))
     proposed_error_risk = 100.0 * (1.0 - (1.0 - p) ** max(proposed_touches, 0.0))
 
-    # Relative fatigue proxy — not a physiological measurement.
-    current_fatigue = (
-        current_touches * cfg.fatigue_points_per_touch
-        + partial_boxes * cfg.fatigue_points_per_wip_cycle
-    )
-    proposed_fatigue = (
-        proposed_touches * cfg.fatigue_points_per_touch
-        + proposed_initial_wip_boxes * cfg.fatigue_points_per_wip_cycle
-    )
+    current_fatigue = current_touches * cfg.fatigue_points_per_touch + partial_boxes * cfg.fatigue_points_per_wip_cycle
+    proposed_fatigue = proposed_touches * cfg.fatigue_points_per_touch + proposed_initial_wip_boxes * cfg.fatigue_points_per_wip_cycle
 
     return {
         "MTO_BELTS_PROXY": mto_belts,
@@ -212,88 +150,41 @@ def simulate_process_model(demand_df: pd.DataFrame, config: ProcessModelConfig |
     cfg = config or ProcessModelConfig()
     cfg.validate()
     demand = normalize_process_demand(demand_df)
-
     rows = []
     for _, row in demand.iterrows():
         metrics = estimate_process_day(row["TOTAL_PALLETS"], cfg)
         rows.append({"DATE": row["DATE"], "TOTAL_PALLETS": row["TOTAL_PALLETS"], **metrics})
-
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    # Current temporary WIP is the current partial-box stream carried by its
-    # dwell period. Proposed WIP starts from the same stream, then applies the
-    # stated process-improvement assumption and any automation bonus.
     current_dwell = max(int(math.ceil(cfg.current_wip_dwell_days)), 1)
     proposed_dwell = max(int(math.ceil(cfg.proposed_wip_dwell_days)), 1)
     current_wip = df["PARTIAL_BOXES"].rolling(current_dwell, min_periods=1).sum()
-
-    effective_wip_reduction = min(
-        100.0,
-        cfg.target_wip_reduction_pct
-        + cfg.automation_wip_bonus_pct * (cfg.automation_coverage_pct / 100.0),
-    )
-    proposed_wip = (
-        current_wip
-        .rolling(proposed_dwell, min_periods=1)
-        .mean()
-        * (1.0 - effective_wip_reduction / 100.0)
-    ).clip(upper=cfg.max_temporary_wip_boxes)
+    effective_wip_reduction = min(100.0, cfg.target_wip_reduction_pct + cfg.automation_wip_bonus_pct * (cfg.automation_coverage_pct / 100.0))
+    proposed_wip = (current_wip.rolling(proposed_dwell, min_periods=1).mean() * (1.0 - effective_wip_reduction / 100.0)).clip(upper=cfg.max_temporary_wip_boxes)
 
     df["CURRENT_WIP_BOXES"] = current_wip
     df["PROPOSED_WIP_BOXES"] = proposed_wip
-    df["WIP_REDUCTION_%"] = np.where(
-        current_wip > 0,
-        (current_wip - proposed_wip) / current_wip * 100.0,
-        np.nan,
-    )
+    df["WIP_REDUCTION_%"] = np.where(current_wip > 0, (current_wip - proposed_wip) / current_wip * 100.0, np.nan)
     df["CURRENT_WIP_STORAGE_M2"] = current_wip * cfg.box_footprint_m2
     df["PROPOSED_WIP_STORAGE_M2"] = proposed_wip * cfg.box_footprint_m2
     df["WIP_STORAGE_CHANGE_M2"] = df["PROPOSED_WIP_STORAGE_M2"] - df["CURRENT_WIP_STORAGE_M2"]
-
     df["TIME_SAVED_SEC"] = df["CURRENT_TIME_SEC"] - df["PROPOSED_TIME_SEC"]
-    df["TIME_REDUCTION_%"] = np.where(
-        df["CURRENT_TIME_SEC"] > 0,
-        df["TIME_SAVED_SEC"] / df["CURRENT_TIME_SEC"] * 100.0,
-        np.nan,
-    )
-    df["TOUCH_REDUCTION_%"] = np.where(
-        df["CURRENT_TOUCHES"] > 0,
-        (df["CURRENT_TOUCHES"] - df["PROPOSED_TOUCHES"]) / df["CURRENT_TOUCHES"] * 100.0,
-        np.nan,
-    )
-    df["FATIGUE_REDUCTION_%"] = np.where(
-        df["CURRENT_FATIGUE_PROXY"] > 0,
-        (df["CURRENT_FATIGUE_PROXY"] - df["PROPOSED_FATIGUE_PROXY"]) / df["CURRENT_FATIGUE_PROXY"] * 100.0,
-        np.nan,
-    )
-    df["ERROR_PROXY_REDUCTION_%"] = np.where(
-        df["CURRENT_ERROR_RISK_%"] > 0,
-        (df["CURRENT_ERROR_RISK_%"] - df["PROPOSED_ERROR_RISK_%"]) / df["CURRENT_ERROR_RISK_%"] * 100.0,
-        np.nan,
-    )
+    df["TIME_REDUCTION_%"] = np.where(df["CURRENT_TIME_SEC"] > 0, df["TIME_SAVED_SEC"] / df["CURRENT_TIME_SEC"] * 100.0, np.nan)
+    df["TOUCH_REDUCTION_%"] = np.where(df["CURRENT_TOUCHES"] > 0, (df["CURRENT_TOUCHES"] - df["PROPOSED_TOUCHES"]) / df["CURRENT_TOUCHES"] * 100.0, np.nan)
+    df["FATIGUE_REDUCTION_%"] = np.where(df["CURRENT_FATIGUE_PROXY"] > 0, (df["CURRENT_FATIGUE_PROXY"] - df["PROPOSED_FATIGUE_PROXY"]) / df["CURRENT_FATIGUE_PROXY"] * 100.0, np.nan)
+    df["ERROR_PROXY_REDUCTION_%"] = np.where(df["CURRENT_ERROR_RISK_%"] > 0, (df["CURRENT_ERROR_RISK_%"] - df["PROPOSED_ERROR_RISK_%"]) / df["CURRENT_ERROR_RISK_%"] * 100.0, np.nan)
 
-    # Storage paradox: WIP reduction frees slots, while single-SKU staging can
-    # consume a configurable density/staging penalty. The net shared-storage
-    # figure is therefore an explicit decision output rather than a hidden KPI.
     wip_reduction_slots = cfg.current_temporary_wip_slots * effective_wip_reduction / 100.0
-    proposed_shared_storage = (
-        cfg.current_shared_storage_slots
-        - wip_reduction_slots
-        + cfg.density_staging_penalty_slots
-    )
+    proposed_shared_storage = cfg.current_shared_storage_slots - wip_reduction_slots + cfg.density_staging_penalty_slots
     net_storage_slots = proposed_shared_storage - cfg.current_shared_storage_slots
-
     df["CURRENT_SHARED_STORAGE_SLOTS"] = cfg.current_shared_storage_slots
     df["WIP_REDUCTION_EFFECT_SLOTS"] = wip_reduction_slots
     df["DENSITY_STAGING_PENALTY_SLOTS"] = cfg.density_staging_penalty_slots
     df["PROPOSED_SHARED_STORAGE_SLOTS"] = proposed_shared_storage
     df["NET_SHARED_STORAGE_CHANGE_SLOTS"] = net_storage_slots
-    df["NET_SHARED_STORAGE_CHANGE_%"] = (
-        net_storage_slots / cfg.current_shared_storage_slots * 100.0
-    )
-
+    df["NET_SHARED_STORAGE_CHANGE_%"] = net_storage_slots / cfg.current_shared_storage_slots * 100.0
     return df
 
 
@@ -301,10 +192,8 @@ def process_summary(df: pd.DataFrame):
     """Return the key Model 2 decision metrics."""
     if df.empty:
         return {}
-
     def mean_col(name):
         return float(df[name].replace([np.inf, -np.inf], np.nan).dropna().mean())
-
     return {
         "average_current_time_min": mean_col("CURRENT_TIME_SEC") / 60.0,
         "average_proposed_time_min": mean_col("PROPOSED_TIME_SEC") / 60.0,
@@ -336,7 +225,6 @@ def process_summary(df: pd.DataFrame):
 
 
 def storage_paradox_table(summary):
-    """Return a presentation-ready storage paradox table."""
     return pd.DataFrame([
         {"STORAGE EFFECT": "Current shared storage", "VALUE": summary["current_shared_storage_slots"], "UNIT": "slots", "INTERPRETATION": "Baseline shared storage"},
         {"STORAGE EFFECT": "WIP reduction effect", "VALUE": -summary["wip_reduction_effect_slots"], "UNIT": "slots", "INTERPRETATION": "Storage released by lower temporary WIP"},
@@ -348,7 +236,6 @@ def storage_paradox_table(summary):
 
 
 def process_kpi_table(summary):
-    """Return the five main Model 2 KPI families used in the SIP presentation."""
     return pd.DataFrame([
         {"METRIC": "Average Processing Time", "UNIT": "minutes/order", "CURRENT": summary["average_current_time_min"], "PROPOSED": summary["average_proposed_time_min"], "IMPROVEMENT_%": summary["time_reduction_pct"]},
         {"METRIC": "Fatigue Proxy", "UNIT": "relative score", "CURRENT": summary["average_current_fatigue"], "PROPOSED": summary["average_proposed_fatigue"], "IMPROVEMENT_%": summary["fatigue_reduction_pct"]},
@@ -359,7 +246,7 @@ def process_kpi_table(summary):
 
 
 def scenario_sensitivity(demand_df: pd.DataFrame, base_config: ProcessModelConfig, parameter: str, values):
-    """Run a simple one-variable sensitivity table for management what-if analysis."""
+    """Run one-variable sensitivity analysis for management what-if testing."""
     rows = []
     for value in values:
         kwargs = dict(base_config.__dict__)
