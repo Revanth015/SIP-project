@@ -1,0 +1,223 @@
+"""SKU movement and slot-allocation scenario engine.
+
+Model 2 is an Operations Scenario Simulation, not a process twin. It consumes
+Model 1's generated feasible pallet slots and uses observed SKU movement to
+rank and allocate those slots under alternative storage strategies.
+"""
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+
+
+def load_table(path):
+    path = Path(path)
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        xl = pd.ExcelFile(path)
+        # Prefer the first non-empty sheet; this keeps raw-upload handling simple.
+        for sheet in xl.sheet_names:
+            df = pd.read_excel(path, sheet_name=sheet)
+            if not df.empty:
+                return df
+    raise ValueError("File must be CSV or Excel and contain a non-empty sheet.")
+
+
+def _find_col(df, names, required=True):
+    lookup = {str(c).strip().upper(): c for c in df.columns}
+    for name in names:
+        if name.upper() in lookup:
+            return lookup[name.upper()]
+    if required:
+        raise ValueError(f"Could not find any of columns: {names}")
+    return None
+
+
+def prepare_movement(mto_path, mta_path=None):
+    """Return clean MTO SKU movement and optional MTA movement."""
+    mto = load_table(mto_path).copy()
+    sku_col = _find_col(mto, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
+    qty_col = _find_col(mto, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
+    date_col = _find_col(mto, ["DATE", "PACKING_DATE", "INVOICE_DATE"], required=False)
+    inv_col = _find_col(mto, ["INVOICE_ID", "INVOICE", "DOCUMENT_NO"], required=False)
+
+    mto = mto.rename(columns={sku_col: "ITEM_SIZE", qty_col: "BELTS"})
+    mto["ITEM_SIZE"] = mto["ITEM_SIZE"].astype("string").str.strip()
+    mto["BELTS"] = pd.to_numeric(mto["BELTS"], errors="coerce")
+    if date_col:
+        mto["DATE"] = pd.to_datetime(mto[date_col], errors="coerce", dayfirst=True)
+    else:
+        mto["DATE"] = pd.NaT
+    if inv_col:
+        mto["INVOICE_ID"] = mto[inv_col].astype("string")
+    else:
+        mto["INVOICE_ID"] = pd.NA
+    mto = mto.drop_duplicates().copy()
+    mto = mto[mto["ITEM_SIZE"].notna() & mto["BELTS"].notna() & (mto["BELTS"] > 0)].copy()
+
+    mta = pd.DataFrame(columns=["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"])
+    if mta_path:
+        raw = load_table(mta_path).copy()
+        sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
+        qty_col = _find_col(raw, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
+        date_col = _find_col(raw, ["DATE", "PACKING_DATE", "INVOICE_DATE"], required=False)
+        inv_col = _find_col(raw, ["INVOICE_ID", "INVOICE", "DOCUMENT_NO"], required=False)
+        raw = raw.rename(columns={sku_col: "ITEM_SIZE", qty_col: "BELTS"})
+        raw["ITEM_SIZE"] = raw["ITEM_SIZE"].astype("string").str.strip()
+        raw["BELTS"] = pd.to_numeric(raw["BELTS"], errors="coerce")
+        raw["DATE"] = pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True) if date_col else pd.NaT
+        raw["INVOICE_ID"] = raw[inv_col].astype("string") if inv_col else pd.NA
+        raw = raw.drop_duplicates().copy()
+        total_mask = raw["ITEM_SIZE"].astype("string").str.contains("grand total|^total$", case=False, na=False)
+        raw = raw[~total_mask]
+        mta = raw[raw["ITEM_SIZE"].notna() & raw["BELTS"].notna() & (raw["BELTS"] > 0)][["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"]].copy()
+
+    sku = (
+        mto.groupby("ITEM_SIZE", as_index=False)
+        .agg(
+            MTO_BELTS=("BELTS", "sum"),
+            MTO_LINES=("ITEM_SIZE", "size"),
+            MTO_INVOICES=("INVOICE_ID", "nunique"),
+            ACTIVE_DAYS=("DATE", "nunique"),
+            ACTIVE_MONTHS=("DATE", lambda x: x.dt.to_period("M").nunique()),
+            AVG_BELTS_PER_LINE=("BELTS", "mean"),
+            MAX_BELTS_PER_LINE=("BELTS", "max"),
+        )
+    )
+    if not mta.empty:
+        mta_sku = mta.groupby("ITEM_SIZE", as_index=False).agg(
+            MTA_BELTS=("BELTS", "sum"),
+            MTA_LINES=("ITEM_SIZE", "size"),
+            MTA_INVOICES=("INVOICE_ID", "nunique"),
+            MTA_ACTIVE_DAYS=("DATE", "nunique"),
+        )
+        sku = sku.merge(mta_sku, on="ITEM_SIZE", how="outer")
+    else:
+        sku["MTA_BELTS"] = 0.0
+        sku["MTA_LINES"] = 0
+        sku["MTA_INVOICES"] = 0
+        sku["MTA_ACTIVE_DAYS"] = 0
+
+    numeric = [c for c in sku.columns if c != "ITEM_SIZE"]
+    sku[numeric] = sku[numeric].fillna(0)
+    sku["TOTAL_MTO_MTA_BELTS"] = sku["MTO_BELTS"] + sku["MTA_BELTS"]
+    sku["TOTAL_LINES"] = sku["MTO_LINES"] + sku["MTA_LINES"]
+    sku["COMBINED_ACTIVE_DAYS"] = sku[["ACTIVE_DAYS", "MTA_ACTIVE_DAYS"]].max(axis=1)
+    sku["MOVEMENT_SHARE_PCT"] = sku["MTO_BELTS"] / max(sku["MTO_BELTS"].sum(), 1) * 100
+
+    # Data-derived temporal frequency: distinct active dates, with line count as a secondary signal.
+    sku["FREQUENCY_SCORE"] = sku["ACTIVE_DAYS"]
+    if sku["FREQUENCY_SCORE"].max() > 0:
+        sku["FREQUENCY_INDEX"] = sku["FREQUENCY_SCORE"] / sku["FREQUENCY_SCORE"].max() * 100
+    else:
+        sku["FREQUENCY_INDEX"] = 0.0
+
+    volume_median = sku["MTO_BELTS"].median()
+    frequency_median = sku["FREQUENCY_SCORE"].median()
+    sku["VOLUME_CLASS"] = np.where(sku["MTO_BELTS"] >= volume_median, "High Volume", "Low Volume")
+    sku["FREQUENCY_CLASS"] = np.where(sku["FREQUENCY_SCORE"] >= frequency_median, "Recurring", "Less Recurring")
+    sku["MOVEMENT_SEGMENT"] = sku["FREQUENCY_CLASS"] + " / " + sku["VOLUME_CLASS"]
+    sku = sku.sort_values(["MTO_BELTS", "FREQUENCY_SCORE"], ascending=False).reset_index(drop=True)
+    sku["VOLUME_RANK"] = np.arange(1, len(sku) + 1)
+    freq_rank = sku.sort_values(["FREQUENCY_SCORE", "MTO_BELTS"], ascending=False).index
+    rank_map = {idx: i + 1 for i, idx in enumerate(freq_rank)}
+    sku["FREQUENCY_RANK"] = sku.index.map(lambda i: rank_map.get(i, np.nan))
+    sku["CUMULATIVE_MOVEMENT_SHARE_PCT"] = sku["MTO_BELTS"].cumsum() / max(sku["MTO_BELTS"].sum(), 1) * 100
+    return sku, mto, mta
+
+
+def _strategy_score(sku, strategy):
+    if strategy == "Frequency priority":
+        return sku["FREQUENCY_SCORE"]
+    if strategy == "Volume priority":
+        return sku["MTO_BELTS"]
+    if strategy == "Frequency × volume":
+        # Normalized geometric combination; no arbitrary weights.
+        f = sku["FREQUENCY_SCORE"] / max(sku["FREQUENCY_SCORE"].max(), 1)
+        v = sku["MTO_BELTS"] / max(sku["MTO_BELTS"].max(), 1)
+        return np.sqrt(f * v)
+    raise ValueError(f"Unknown strategy: {strategy}")
+
+
+def rank_skus(sku, strategy):
+    out = sku.copy()
+    out["STRATEGY_SCORE"] = _strategy_score(out, strategy)
+    return out.sort_values(["STRATEGY_SCORE", "MTO_BELTS", "FREQUENCY_SCORE"], ascending=False).reset_index(drop=True)
+
+
+def allocate_slots(sku_ranked, slot_df, belts_per_slot):
+    """Allocate fixed Model 1 slots sequentially using estimated storage load.
+
+    belts_per_slot is an explicit scenario parameter. It converts observed
+    movement quantity into pallet-slot equivalents; it is not presented as an
+    observed inventory balance.
+    """
+    if belts_per_slot <= 0:
+        raise ValueError("Belts per slot must be greater than zero.")
+    slots = slot_df.copy().reset_index(drop=True)
+    if slots.empty:
+        raise ValueError("Model 1 generated no feasible slots for the selected area.")
+    rows = []
+    slot_pos = 0
+    for rank, row in sku_ranked.iterrows():
+        required = int(math.ceil(float(row["MTO_BELTS"]) / belts_per_slot))
+        required = max(required, 1)
+        for local in range(required):
+            if slot_pos >= len(slots):
+                rows.append({
+                    "ALLOCATION_SEQUENCE": len(rows) + 1,
+                    "SLOT_ID": None,
+                    "ITEM_SIZE": row["ITEM_SIZE"],
+                    "SKU_RANK": rank + 1,
+                    "STRATEGY_SCORE": row["STRATEGY_SCORE"],
+                    "SLOTS_REQUIRED_FOR_SKU": required,
+                    "SLOT_WITHIN_SKU": local + 1,
+                    "STATUS": "OVERFLOW",
+                })
+            else:
+                s = slots.iloc[slot_pos]
+                rows.append({
+                    "ALLOCATION_SEQUENCE": len(rows) + 1,
+                    "SLOT_ID": s["SLOT_ID"],
+                    "ITEM_SIZE": row["ITEM_SIZE"],
+                    "SKU_RANK": rank + 1,
+                    "STRATEGY_SCORE": row["STRATEGY_SCORE"],
+                    "SLOTS_REQUIRED_FOR_SKU": required,
+                    "SLOT_WITHIN_SKU": local + 1,
+                    "STATUS": "ALLOCATED",
+                    "X_M": s["X_M"],
+                    "Y_M": s["Y_M"],
+                    "DISTANCE_FROM_DOOR_M": s["DISTANCE_FROM_DOOR_M"],
+                })
+                slot_pos += 1
+    allocation = pd.DataFrame(rows)
+    allocated = allocation[allocation["STATUS"] == "ALLOCATED"]
+    overflow = allocation[allocation["STATUS"] == "OVERFLOW"]
+    summary = {
+        "total_slots": len(slots),
+        "allocated_slots": len(allocated),
+        "empty_slots": max(len(slots) - len(allocated), 0),
+        "overflow_slot_equivalents": len(overflow),
+        "skus_fully_allocated": int((sku_ranked.apply(lambda r: math.ceil(r["MTO_BELTS"] / belts_per_slot), axis=1).cumsum() <= len(slots)).sum()),
+        "allocated_movement_belts": float(sku_ranked.iloc[:0]["MTO_BELTS"].sum()) if False else float(0),
+    }
+    if not allocation.empty:
+        allocated_skus = set(allocated["ITEM_SIZE"].dropna())
+        summary["allocated_movement_belts"] = float(sku_ranked[sku_ranked["ITEM_SIZE"].isin(allocated_skus)]["MTO_BELTS"].sum())
+        summary["movement_coverage_pct"] = summary["allocated_movement_belts"] / max(float(sku_ranked["MTO_BELTS"].sum()), 1) * 100
+    else:
+        summary["movement_coverage_pct"] = 0.0
+    summary["slot_utilization_pct"] = summary["allocated_slots"] / max(summary["total_slots"], 1) * 100
+    return allocation, summary
+
+
+def build_scenario_table(sku, slot_df, belts_per_slot):
+    results = []
+    allocations = {}
+    for strategy in ["Frequency priority", "Volume priority", "Frequency × volume"]:
+        ranked = rank_skus(sku, strategy)
+        allocation, summary = allocate_slots(ranked, slot_df, belts_per_slot)
+        allocations[strategy] = allocation
+        results.append({"STRATEGY": strategy, **summary})
+    return pd.DataFrame(results), allocations
