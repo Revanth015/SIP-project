@@ -4,13 +4,12 @@ The page is intentionally connected to the main app's Process-4 state. The
 current physical baseline is stated directly from the validated project baseline
 (66 operational Poly-V pallet positions); no fake SKU-location mapping is created.
 """
-from io import BytesIO
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from shapely.geometry import Point
 
-from core.layout_optimizer import STRATEGIES, prepare_sku_demand, evaluate_strategy, compare_layouts
+from core.layout_optimizer import STRATEGIES, prepare_sku_demand, evaluate_strategy, compare_layouts, replay_flow
 from core.export_utils import workbook_bytes
 
 st.set_page_config(page_title="Management Decision — JK Fenner", page_icon="🎯", layout="wide")
@@ -34,7 +33,6 @@ def get_process4_inputs():
     required = {"SLOT_ID", "X_M", "Y_M", "DISTANCE_FROM_DOOR_M"}
     if not required.issubset(slots.columns):
         return None, None, area_range
-    from shapely.geometry import Point
     mask = slots.apply(lambda q: region.covers(Point(float(q.X_M), float(q.Y_M))), axis=1)
     slots = slots[mask].sort_values("DISTANCE_FROM_DOOR_M").reset_index(drop=True)
     mto = m1["demand_detail"].copy()
@@ -54,7 +52,6 @@ def mm(series, higher=True):
 
 
 slots, mto, area_range = get_process4_inputs()
-
 st.subheader("🔗 Data lineage")
 if slots is None or mto is None:
     st.error("🔴 Process 4 is not complete. Return to the main app, run Model 1, select the exact study area in Process 4, and then open Management Decision.")
@@ -63,7 +60,6 @@ if slots is None or mto is None:
 m1 = st.session_state["m1_result"]
 model1_slots = m1["slot_df"]
 
-# Explicit current physical state — not a fabricated SKU-location mapping.
 st.subheader("1. Current physical state")
 c = st.columns(5)
 c[0].metric("Current operational capacity", f"{CURRENT_OPERATIONAL_CAPACITY:,} pallet slots")
@@ -75,23 +71,13 @@ overflow_days = int(m1.get("demand_metrics", {}).get("physical_overflow_days", 0
 c[3].metric("Historical peak demand", f"{peak:.0f} pallets")
 c[4].metric("Current-state overflow days", f"{overflow_days:,}")
 st.caption(f"Current physical baseline: {CURRENT_STATE_SOURCE}. The current 66-slot figure is a physical operational baseline; it is not treated as an SKU-location map.")
-
 if area_range:
-    st.info(f"🟢 **LIVE PROCESS-4 DATA CONNECTED** — X {area_range[0]:.2f}–{area_range[1]:.2f} m · Y {area_range[2]:.2f}–{area_range[3]:.2f} m · **{len(slots):,} physical locations**")
+    st.success(f"🟢 **LIVE PROCESS-4 DATA CONNECTED** — X {area_range[0]:.2f}–{area_range[1]:.2f} m · Y {area_range[2]:.2f}–{area_range[3]:.2f} m · **{len(slots):,} physical locations**")
 
-# Show the actual Model-1 optimization decision when available.
 st.subheader("2. Physical layout optimization used before SKU slotting")
 winner = m1.get("winner", {})
 layout_rows = []
-for key, label in [
-    ("orientation", "Pallet orientation (deg)"),
-    ("wall_clearance_m", "Wall clearance (m)"),
-    ("main_aisle_m", "Main aisle (m)"),
-    ("cross_aisle_m", "Cross aisle (m)"),
-    ("capacity", "Generated feasible slots"),
-    ("avg_distance_m", "Average slot distance (m)"),
-    ("score", "Layout score"),
-]:
+for key, label in [("orientation", "Pallet orientation (deg)"),("wall_clearance_m", "Wall clearance (m)"),("main_aisle_m", "Main aisle (m)"),("cross_aisle_m", "Cross aisle (m)"),("capacity", "Generated feasible slots"),("avg_distance_m", "Average slot distance (m)"),("score", "Layout score")]:
     if key in winner:
         layout_rows.append({"Metric": label, "Value": winner[key]})
 if layout_rows:
@@ -127,7 +113,8 @@ st.subheader("4. Optimize SKU allocation within the fixed Process-4 physical opp
 results = {}
 for strategy in STRATEGIES:
     ranked, allocation, location, summary = evaluate_strategy(mto, slots, sku, strategy, capacity_units=capacity)
-    results[strategy] = {"ranked": ranked, "allocation": allocation, "location": location, "summary": summary}
+    flow, daily = replay_flow(mto, allocation)
+    results[strategy] = {"ranked": ranked, "allocation": allocation, "location": location, "summary": summary, "flow": flow, "daily": daily}
 comparison = compare_layouts(results)
 
 w = {"frequency": wf / total_w, "volume": wv / total_w, "travel": wt / total_w, "space": ws / total_w}
@@ -157,7 +144,7 @@ rc[5].metric("Used locations", int(recommended["location"]["USED_STORAGE_EQ"].gt
 st.markdown("**Recommended SKU-location allocation — multiple SKUs may share one physical location subject to model capacity.**")
 st.dataframe(recommended["allocation"].sort_values(["RANK", "DISTANCE_FROM_DOOR_M"]), use_container_width=True, height=450)
 
-st.subheader("6. Location utilization")
+st.subheader("6. Recommended location utilization")
 st.dataframe(recommended["location"].sort_values("DISTANCE_FROM_DOOR_M"), use_container_width=True, height=350)
 
 st.subheader("7. Management action list")
@@ -173,7 +160,10 @@ a["RATIONALE"] = a["MOVEMENT_SEGMENT"] + "; movement rank " + a["RANK"].astype(s
 actions = a[["ITEM_SIZE", "SLOT_ID", "ALLOCATED_STORAGE_EQ", "DISTANCE_FROM_DOOR_M", "MOVEMENT_SEGMENT", "ACTION", "RATIONALE"]]
 st.dataframe(actions, use_container_width=True, height=400)
 
-st.subheader("8. Sensitivity analysis")
+st.subheader("8. Historical daily replay")
+st.dataframe(recommended["daily"], use_container_width=True, height=300)
+
+st.subheader("9. Sensitivity analysis")
 sensitivity = []
 scenarios = [("Balanced",25,25,25,25),("Movement priority",15,20,50,15),("Service priority",50,20,20,10),("Volume priority",20,50,20,10),("Space priority",15,20,15,50)]
 for name, af, av, at, ass in scenarios:
@@ -181,18 +171,17 @@ for name, af, av, at, ass in scenarios:
     scores["score"] = (af/100)*mm(scores["Line coverage %"])+(av/100)*mm(scores["Belt coverage %"])+(at/100)*mm(scores["Total one-way travel m"],False)+(ass/100)*mm(scores["Average location utilization %"])
     scores["rank"] = scores["score"].rank(method="min", ascending=False).astype(int)
     winner_s = scores.sort_values("rank").iloc[0]
-    sensitivity.append({"Scenario":name,"Winner":winner_s["Strategy"],"Score":winner_s["score"]*100})
+    sensitivity.append({"Scenario":name,"Frequency %":af,"Volume %":av,"Travel %":at,"Space %":ass,"Winner":winner_s["Strategy"],"Score":winner_s["score"]*100})
 sensitivity_df = pd.DataFrame(sensitivity)
 st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
 
-st.subheader("9. Current state vs optimized state")
-# Physical baseline is directly known. SKU movement baseline is deliberately not invented.
+st.subheader("10. Current state vs optimized state")
 current_demand = m1.get("demand_metrics", {})
 current_rows = [
     {"Metric":"Operational pallet capacity", "Current state":CURRENT_OPERATIONAL_CAPACITY, "Optimized / proposed":len(model1_slots), "Unit":"pallet slots", "Basis":"Validated current operational baseline vs Model-1 feasible layout"},
     {"Metric":"Process-4 physical opportunity", "Current state":CURRENT_OPERATIONAL_CAPACITY, "Optimized / proposed":len(slots), "Unit":"pallet locations", "Basis":"Current baseline vs selected study-area opportunity"},
     {"Metric":"Peak historical demand", "Current state":current_demand.get("peak_demand", peak), "Optimized / proposed":current_demand.get("peak_demand", peak), "Unit":"pallets/day", "Basis":"Same historical demand used for both scenarios"},
-    {"Metric":"Physical overflow days", "Current state":current_demand.get("physical_overflow_days", overflow_days), "Optimized / proposed":int((m1.get("derived_daily_demand", pd.DataFrame()).get("TOTAL_PALLETS", pd.Series(dtype=float)) > len(model1_slots)).sum()), "Unit":"days", "Basis":"Historical demand replay against capacity"},
+    {"Metric":"Physical overflow days", "Current state":current_demand.get("physical_overflow_days", overflow_days), "Optimized / proposed":int((m1.get("derived_daily_demand", pd.DataFrame()).get("TOTAL_PALLETS", pd.Series(dtype=float)) > len(model1_slots)).sum()), "Unit":"days", "Basis":"Historical demand replay against Model-1 capacity"},
 ]
 current_vs_layout = pd.DataFrame(current_rows)
 st.dataframe(current_vs_layout, use_container_width=True, hide_index=True)
@@ -201,27 +190,33 @@ st.warning("A true current-vs-optimized SKU travel comparison requires the actua
 fig = px.bar(decision, x="Strategy", y="Decision Score", title="Management decision score")
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("10. One-file complete output")
+st.subheader("11. One-file complete output")
 exports = {
     "00_Current_State": current_vs_layout,
     "01_Process4_Slots": slots,
     "02_Model1_Winner": pd.DataFrame(layout_rows),
-    "03_SKU_Movement_Master": sku,
-    "04_Strategy_Comparison": comparison,
-    "05_Decision_Score": decision,
-    "06_Recommended_Allocation": recommended["allocation"],
-    "07_Location_Utilization": recommended["location"],
-    "08_Management_Actions": actions,
-    "09_Sensitivity": sensitivity_df,
-    "10_Recommended_Daily_Flow": recommended.get("daily", pd.DataFrame()),
+    "03_Model1_Search": m1.get("search_df", pd.DataFrame()),
+    "04_Model1_Capacity": m1.get("capacity_table", pd.DataFrame()),
+    "05_Daily_Demand": m1.get("derived_daily_demand", pd.DataFrame()),
+    "06_MTO_Detail": mto,
+    "07_SKU_Movement_Master": sku,
+    "08_Strategy_Comparison": comparison,
+    "09_Decision_Score": decision,
+    "10_Recommended_Allocation": recommended["allocation"],
+    "11_Location_Utilization": recommended["location"],
+    "12_Management_Actions": actions,
+    "13_Sensitivity": sensitivity_df,
+    "14_Recommended_Daily_Replay": recommended["daily"],
+    "15_Recommended_Flow_Replay": recommended["flow"],
 }
 for strategy_name, data in results.items():
-    exports[f"{strategy_name[:20]}_Ranked"] = data["ranked"]
-    exports[f"{strategy_name[:20]}_Allocation"] = data["allocation"]
-    exports[f"{strategy_name[:20]}_Location"] = data["location"]
+    exports[f"{strategy_name[:18]}_Ranked"] = data["ranked"]
+    exports[f"{strategy_name[:18]}_Allocation"] = data["allocation"]
+    exports[f"{strategy_name[:18]}_Location"] = data["location"]
+    exports[f"{strategy_name[:18]}_Daily"] = data["daily"]
 
 xlsx = workbook_bytes(exports)
-st.download_button("📥 Download ALL outputs as one Excel workbook", data=xlsx, file_name="JK_Fenner_Digital_Twin_Complete_Output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
-st.caption("The workbook contains the physical baseline, Process-4 slots, Model-1 layout decision, SKU movement master, every strategy, recommended allocation, location utilization, action list and sensitivity analysis.")
+st.download_button("📥 Download ALL outputs as ONE Excel workbook", data=xlsx, file_name="JK_Fenner_Digital_Twin_Complete_Output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
+st.caption("One workbook contains the current baseline, Process-4 physical opportunity, Model-1 layout search/capacity, MTO detail, SKU movement master, every allocation strategy, recommended layout, utilization, daily replay, management actions and sensitivity analysis.")
 
-st.caption("Model boundary: the SKU allocation is a scenario-based heuristic optimization over the fixed Process-4 physical opportunity. Storage capacity, SKU compatibility, replenishment, congestion and actual current SKU locations require physical validation before implementation.")
+st.caption("Model boundary: physical layout optimization is performed by Model 1 under the supplied warehouse constraints; Model 2 then performs scenario-based movement/space allocation over the fixed Process-4 opportunity. Storage capacity, SKU compatibility, replenishment, congestion and actual current SKU locations require physical validation before implementation.")
