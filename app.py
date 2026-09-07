@@ -1,4 +1,4 @@
-"""JK Fenner Warehouse Digital Twin — integrated Model 1 + Model 2 workflow."""
+"""JK Fenner Warehouse Digital Twin — Model 1 physical twin + Model 2 frequency slotting."""
 from pathlib import Path
 import io
 import tempfile
@@ -11,12 +11,10 @@ import streamlit as st
 from shapely.geometry import Point, box as sbox
 
 from core.pipeline import prepare_cad, run_pipeline
-from core.scenario_engine import prepare_movement
-from core.simulation_engine import SimulationConfig, simulate_daily, simulation_summary
 
 st.set_page_config(page_title="JK Fenner Warehouse Digital Twin", page_icon="🏭", layout="wide")
 st.title("🏭 JK Fenner Warehouse Digital Twin")
-st.caption("CAD → operating door → Model 1 physical slots → exact study area → Model 2 movement-based slotting")
+st.caption("CAD → physical slots → exact study area → frequency-matrix slotting → daily flow simulation")
 
 FALLBACK_BELTS_PER_BOX = 28
 
@@ -39,25 +37,22 @@ def load_excel(path, preferred_sheet=None):
 
 def find_col(df, names, required=True):
     lookup = {str(c).strip().upper(): c for c in df.columns}
-    for n in names:
-        if n.upper() in lookup:
-            return lookup[n.upper()]
+    for name in names:
+        if name.upper() in lookup:
+            return lookup[name.upper()]
     if required:
         raise ValueError(f"Missing one of {names}. Available columns: {list(df.columns)}")
     return None
 
 
 def derive_daily_demand(mto_path, box_path):
-    """Derive daily pallet demand directly from MTO + Size–Box Master."""
     mto = load_excel(mto_path, "Consolidated_Packing_Lists").copy()
     date_col = find_col(mto, ["DATE", "DATETIME", "DAY"])
     sku_col = find_col(mto, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE"])
     qty_col = find_col(mto, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
-
     box = load_excel(box_path).copy()
     bsku = find_col(box, ["BELT SIZE", "ITEM_SIZE", "BELT_SIZE", "SKU", "ITEM CODE", "SIZE"])
     bqty = find_col(box, ["UNITS PER BOX", "UNITS_PER_BOX", "BELTS_PER_BOX", "STANDARD BOX QUANTITY", "BOX_QTY"])
-
     mto = mto.rename(columns={date_col: "DATE", sku_col: "ITEM_SIZE", qty_col: "BELTS"})
     box = box.rename(columns={bsku: "ITEM_SIZE", bqty: "BELTS_PER_BOX"})
     mto["DATE"] = pd.to_datetime(mto["DATE"], errors="coerce", dayfirst=True)
@@ -67,31 +62,24 @@ def derive_daily_demand(mto_path, box_path):
     box["BELTS_PER_BOX"] = pd.to_numeric(box["BELTS_PER_BOX"], errors="coerce")
     box = box.dropna(subset=["ITEM_SIZE", "BELTS_PER_BOX"])
     box = box[box["BELTS_PER_BOX"] > 0].drop_duplicates("ITEM_SIZE")
-
     d = mto.dropna(subset=["DATE", "ITEM_SIZE", "BELTS"]).copy()
-    d = d[d["BELTS"] > 0]
+    d = d[d["BELTS"] > 0].drop_duplicates().copy()
     d = d.merge(box[["ITEM_SIZE", "BELTS_PER_BOX"]], on="ITEM_SIZE", how="left")
     d["BELTS_PER_BOX_SOURCE"] = np.where(d["BELTS_PER_BOX"].notna(), "Size–Box Master", f"Fallback = {FALLBACK_BELTS_PER_BOX}")
     d["BELTS_PER_BOX"] = d["BELTS_PER_BOX"].fillna(FALLBACK_BELTS_PER_BOX)
     d["BOXES"] = np.ceil(d["BELTS"] / d["BELTS_PER_BOX"]).astype(int)
-
-    daily = d.groupby("DATE", as_index=False).agg(
-        TOTAL_BELTS=("BELTS", "sum"),
-        TOTAL_BOXES=("BOXES", "sum"),
-        TRANSACTION_LINES=("ITEM_SIZE", "size"),
-    )
+    daily = d.groupby("DATE", as_index=False).agg(TOTAL_BELTS=("BELTS", "sum"), TOTAL_BOXES=("BOXES", "sum"), TRANSACTION_LINES=("ITEM_SIZE", "size"))
     daily["TOTAL_PALLETS"] = np.ceil(daily["TOTAL_BOXES"] / 32.0).astype(int)
     return daily.sort_values("DATE").reset_index(drop=True), d
 
 
 def cad_plot(cad, door=None, turn=None):
     fig = go.Figure()
-    for e in cad.get("entities", []):
-        pts = e.get("points") or []
-        if len(pts) > 1:
-            fig.add_trace(go.Scatter(x=[p[0] for p in pts], y=[p[1] for p in pts], mode="lines", showlegend=False, hoverinfo="skip"))
     x, y = cad["warehouse"].exterior.xy
     fig.add_trace(go.Scatter(x=list(x), y=list(y), mode="lines", line=dict(width=3), name="Warehouse"))
+    for o in cad.get("obstacles", []):
+        x, y = o.exterior.xy
+        fig.add_trace(go.Scatter(x=list(x), y=list(y), mode="lines", fill="toself", opacity=.2, showlegend=False))
     for i, d in enumerate(cad.get("doors", []), 1):
         fig.add_trace(go.Scatter(x=[d["x"]], y=[d["y"]], mode="markers+text", text=[f"D{i}"], textposition="top center", marker=dict(size=14, symbol="star"), name=f"CAD Door {i}"))
     if door:
@@ -104,71 +92,59 @@ def cad_plot(cad, door=None, turn=None):
     return fig
 
 
-def m1_plot(r, title="Model 1 — generated physical slots", selectable=False):
+def m1_plot(r, title="Model 1 — generated physical slots", selectable=False, allocation=None):
     fig = go.Figure()
     x, y = r["warehouse"].exterior.xy
     fig.add_trace(go.Scatter(x=list(x), y=list(y), mode="lines", line=dict(width=3), name="Warehouse"))
     for o in r.get("obstacles", []):
         x, y = o.exterior.xy
         fig.add_trace(go.Scatter(x=list(x), y=list(y), mode="lines", fill="toself", opacity=.2, showlegend=False))
-    s = r["slot_df"]
-    fig.add_trace(go.Scatter(x=s.X_M, y=s.Y_M, mode="markers", marker=dict(size=6, symbol="square-open"), name="Model 1 slots", customdata=s.SLOT_ID, hovertemplate="%{customdata}<br>X=%{x:.2f}<br>Y=%{y:.2f}<extra></extra>"))
+    s = r["slot_df"].copy()
+    if allocation is not None and not allocation.empty:
+        a = allocation.dropna(subset=["SLOT_ID"])[["SLOT_ID","FREQUENCY_CLASS","MOVEMENT_SEGMENT","ITEM_SIZE","FREQUENCY_RANK"]].drop_duplicates("SLOT_ID")
+        s = s.merge(a, on="SLOT_ID", how="left")
+        assigned = s[s["ITEM_SIZE"].notna()]
+        unassigned = s[s["ITEM_SIZE"].isna()]
+        fig.add_trace(go.Scatter(x=unassigned.X_M, y=unassigned.Y_M, mode="markers", marker=dict(size=7, symbol="square-open"), name="Unassigned Model 1 slots", hovertemplate="%{x:.2f}, %{y:.2f}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=assigned.X_M, y=assigned.Y_M, mode="markers", marker=dict(size=9, symbol="square"), name="Frequency-assigned slots", customdata=np.c_[assigned.SLOT_ID,assigned.ITEM_SIZE,assigned.FREQUENCY_RANK,assigned.MOVEMENT_SEGMENT], hovertemplate="Slot %{customdata[0]}<br>%{customdata[1]}<br>Frequency rank: %{customdata[2]}<br>%{customdata[3]}<extra></extra>"))
+    else:
+        fig.add_trace(go.Scatter(x=s.X_M, y=s.Y_M, mode="markers", marker=dict(size=6, symbol="square-open"), name="Model 1 slots", customdata=s.SLOT_ID, hovertemplate="%{customdata}<br>X=%{x:.2f}<br>Y=%{y:.2f}<extra></extra>"))
     d = r["door"]
     fig.add_trace(go.Scatter(x=[d.x], y=[d.y], mode="markers+text", text=["DOOR"], textposition="top center", marker=dict(size=15, symbol="star"), name="Operating door"))
     tc = r.get("turning_center")
     if r.get("turning_enabled") and tc:
         rr = r.get("turning_diameter_m", 7) / 2
         fig.add_shape(type="circle", x0=tc.x-rr, x1=tc.x+rr, y0=tc.y-rr, y1=tc.y+rr, line=dict(dash="dot"))
-    fig.update_layout(height=700, title=title, xaxis_title="X (m)", yaxis_title="Y (m)", dragmode="select" if selectable else "zoom", margin=dict(l=20,r=20,t=50,b=20), clickmode="event+select")
+    fig.update_layout(height=700, title=title, xaxis_title="X (m)", yaxis_title="Y (m)", dragmode="select" if selectable else "zoom", margin=dict(l=20,r=20,t=50,b=20))
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     return fig
 
 
-def _as_dict(obj):
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj
-    if hasattr(obj, "to_dict"):
-        try:
-            return obj.to_dict()
-        except Exception:
-            pass
-    try:
-        return dict(obj)
-    except Exception:
-        return None
-
-
 def event_range(event):
-    """Robustly read a Plotly box-selection range across Streamlit versions."""
     if event is None:
         return None
-    data = _as_dict(event)
-    if data is None:
-        return None
-    selection = data.get("selection", {})
-    if not isinstance(selection, dict):
-        selection = _as_dict(selection) or {}
-    boxes = selection.get("box", [])
-    if isinstance(boxes, dict):
-        boxes = list(boxes.values()) if not ("range" in boxes) else [boxes]
-    if not isinstance(boxes, (list, tuple)):
-        boxes = [boxes]
-    for item in reversed(boxes):
-        b = _as_dict(item) or {}
-        rng = b.get("range", b)
-        rng = _as_dict(rng) or rng
-        if not isinstance(rng, dict):
-            continue
-        xr = rng.get("x")
-        yr = rng.get("y")
-        if xr is None or yr is None:
-            continue
+    try:
+        data = event.to_dict()
+    except Exception:
         try:
-            return float(min(xr)), float(max(xr)), float(min(yr)), float(max(yr))
+            data = dict(event)
         except Exception:
-            continue
+            return None
+    sel = data.get("selection", {})
+    if hasattr(sel, "to_dict"):
+        sel = sel.to_dict()
+    boxes = sel.get("box", []) if isinstance(sel, dict) else []
+    if isinstance(boxes, dict):
+        boxes = [boxes]
+    for b in reversed(boxes):
+        if hasattr(b, "to_dict"):
+            b = b.to_dict()
+        rng = b.get("range", b) if isinstance(b, dict) else {}
+        if hasattr(rng, "to_dict"):
+            rng = rng.to_dict()
+        if isinstance(rng, dict) and rng.get("x") is not None and rng.get("y") is not None:
+            xr, yr = rng["x"], rng["y"]
+            return float(min(xr)), float(max(xr)), float(min(yr)), float(max(yr))
     return None
 
 
@@ -177,13 +153,99 @@ def slots_in(df, region):
     return df[mask].copy().sort_values("DISTANCE_FROM_DOOR_M").reset_index(drop=True)
 
 
-def selected_sim(r, slots):
-    n = len(slots)
-    planning = max(int(n * r["config"]["target_occupancy_pct"] / 100), 1)
-    c = r["config"]
-    cfg = SimulationConfig(forklift_speed_mps=c["forklift_speed_mps"], handling_time_sec_per_pallet=c["handling_time_sec_per_pallet"], target_occupancy_pct=c["target_occupancy_pct"])
-    daily, occupancy = simulate_daily(r["demand"], slots, n, planning, cfg)
-    return daily, occupancy, simulation_summary(daily)
+def build_frequency_matrix(mto_detail):
+    d = mto_detail[["DATE", "ITEM_SIZE", "BELTS"]].copy()
+    d["ITEM_SIZE"] = d["ITEM_SIZE"].astype("string").str.strip().str.upper()
+    d["BELTS"] = pd.to_numeric(d["BELTS"], errors="coerce")
+    d = d.dropna(subset=["DATE", "ITEM_SIZE", "BELTS"])
+    d = d[d["BELTS"] > 0]
+    sku = d.groupby("ITEM_SIZE", as_index=False).agg(
+        MTO_BELTS=("BELTS", "sum"),
+        MTO_LINES=("ITEM_SIZE", "size"),
+        ACTIVE_DAYS=("DATE", "nunique"),
+        ACTIVE_MONTHS=("DATE", lambda x: x.dt.to_period("M").nunique()),
+        AVG_BELTS_PER_LINE=("BELTS", "mean"),
+    )
+    freq_cut = float(sku["ACTIVE_DAYS"].median())
+    vol_cut = float(sku["MTO_BELTS"].median())
+    sku["FREQUENCY_CLASS"] = np.where(sku["ACTIVE_DAYS"] >= freq_cut, "High Frequency", "Low Frequency")
+    sku["VOLUME_CLASS"] = np.where(sku["MTO_BELTS"] >= vol_cut, "High Volume", "Low Volume")
+    sku["MOVEMENT_SEGMENT"] = sku["FREQUENCY_CLASS"] + " / " + sku["VOLUME_CLASS"]
+    priority = {
+        "High Frequency / High Volume": 1,
+        "High Frequency / Low Volume": 2,
+        "Low Frequency / High Volume": 3,
+        "Low Frequency / Low Volume": 4,
+    }
+    sku["MATRIX_PRIORITY"] = sku["MOVEMENT_SEGMENT"].map(priority)
+    sku = sku.sort_values(["MATRIX_PRIORITY", "ACTIVE_DAYS", "MTO_BELTS", "MTO_LINES"], ascending=[True, False, False, False]).reset_index(drop=True)
+    sku["FREQUENCY_RANK"] = np.arange(1, len(sku) + 1)
+    return sku, freq_cut, vol_cut
+
+
+def assign_frequency_slots(sku, slots):
+    """One physical Model 1 slot per prioritized SKU; no belts/slot assumption."""
+    slots = slots.sort_values("DISTANCE_FROM_DOOR_M").reset_index(drop=True).copy()
+    n = min(len(slots), len(sku))
+    ranked = sku.head(n).copy()
+    out = slots.head(n).copy()
+    out["ITEM_SIZE"] = ranked["ITEM_SIZE"].to_numpy()
+    out["FREQUENCY_RANK"] = ranked["FREQUENCY_RANK"].to_numpy()
+    out["ACTIVE_DAYS"] = ranked["ACTIVE_DAYS"].to_numpy()
+    out["MTO_LINES"] = ranked["MTO_LINES"].to_numpy()
+    out["MTO_BELTS"] = ranked["MTO_BELTS"].to_numpy()
+    out["FREQUENCY_CLASS"] = ranked["FREQUENCY_CLASS"].to_numpy()
+    out["VOLUME_CLASS"] = ranked["VOLUME_CLASS"].to_numpy()
+    out["MOVEMENT_SEGMENT"] = ranked["MOVEMENT_SEGMENT"].to_numpy()
+    out["MATRIX_PRIORITY"] = ranked["MATRIX_PRIORITY"].to_numpy()
+    out["STATUS"] = "ASSIGNED"
+    return out
+
+
+def simulate_daily_flow(mto_detail, allocation, total_daily):
+    """Replay historical MTO flow through the assigned SKU locations day by day."""
+    flow = mto_detail[["DATE", "ITEM_SIZE", "BELTS"]].copy()
+    flow["ITEM_SIZE"] = flow["ITEM_SIZE"].astype("string").str.strip().str.upper()
+    flow["BELTS"] = pd.to_numeric(flow["BELTS"], errors="coerce")
+    flow = flow.dropna(subset=["DATE", "ITEM_SIZE", "BELTS"])
+    flow = flow[flow["BELTS"] > 0].copy()
+    a = allocation[["ITEM_SIZE", "SLOT_ID", "X_M", "Y_M", "DISTANCE_FROM_DOOR_M", "FREQUENCY_RANK", "MOVEMENT_SEGMENT"]].copy()
+    flow = flow.merge(a, on="ITEM_SIZE", how="left")
+    flow["ASSIGNED"] = flow["SLOT_ID"].notna()
+    flow["TRAVEL_DISTANCE_M"] = flow["DISTANCE_FROM_DOOR_M"].fillna(0)
+    flow["TRAVEL_DISTANCE_ASSIGNED_M"] = np.where(flow["ASSIGNED"], flow["DISTANCE_FROM_DOOR_M"], 0)
+    daily = flow.groupby("DATE", as_index=False).agg(
+        FLOW_LINES=("ITEM_SIZE", "size"),
+        FLOW_BELTS=("BELTS", "sum"),
+        ASSIGNED_LINES=("ASSIGNED", "sum"),
+        ASSIGNED_BELTS=("BELTS", lambda s: float(s[flow.loc[s.index, "ASSIGNED"]].sum())),
+        EST_ONE_WAY_TRAVEL_M=("TRAVEL_DISTANCE_ASSIGNED_M", "sum"),
+        ASSIGNED_SKUS=("ITEM_SIZE", lambda s: int(flow.loc[s.index & flow["ASSIGNED"], "ITEM_SIZE"].nunique()) if False else 0),
+    )
+    # Recalculate assigned SKU count and percentages cleanly.
+    sku_count = flow[flow["ASSIGNED"]].groupby("DATE")["ITEM_SIZE"].nunique().rename("ASSIGNED_SKUS")
+    daily = daily.drop(columns=["ASSIGNED_SKUS"]).merge(sku_count, on="DATE", how="left").fillna({"ASSIGNED_SKUS": 0})
+    daily["ASSIGNED_LINES"] = daily["ASSIGNED_LINES"].astype(int)
+    daily["UNASSIGNED_LINES"] = daily["FLOW_LINES"] - daily["ASSIGNED_LINES"]
+    daily["UNASSIGNED_BELTS"] = daily["FLOW_BELTS"] - daily["ASSIGNED_BELTS"]
+    daily["FLOW_COVERAGE_BY_LINES_%"] = daily["ASSIGNED_LINES"] / daily["FLOW_LINES"].replace(0, np.nan) * 100
+    daily["FLOW_COVERAGE_BY_BELTS_%"] = daily["ASSIGNED_BELTS"] / daily["FLOW_BELTS"].replace(0, np.nan) * 100
+    daily["AVG_TRAVEL_M_PER_ASSIGNED_LINE"] = daily["EST_ONE_WAY_TRAVEL_M"] / daily["ASSIGNED_LINES"].replace(0, np.nan)
+    daily = daily.sort_values("DATE").reset_index(drop=True)
+    summary = {
+        "operating_days": int(len(daily)),
+        "assigned_skus": int(allocation["ITEM_SIZE"].nunique()),
+        "available_slots": int(len(allocation)),
+        "flow_lines": int(flow.shape[0]),
+        "assigned_lines": int(flow["ASSIGNED"].sum()),
+        "line_coverage_pct": float(flow["ASSIGNED"].mean() * 100),
+        "flow_belts": float(flow["BELTS"].sum()),
+        "assigned_belts": float(flow.loc[flow["ASSIGNED"], "BELTS"].sum()),
+        "belt_coverage_pct": float(flow.loc[flow["ASSIGNED"], "BELTS"].sum() / max(flow["BELTS"].sum(), 1) * 100),
+        "total_one_way_travel_m": float(flow["TRAVEL_DISTANCE_ASSIGNED_M"].sum()),
+        "avg_one_way_m_per_assigned_line": float(flow.loc[flow["ASSIGNED"], "DISTANCE_FROM_DOOR_M"].mean()),
+    }
+    return flow, daily, summary
 
 
 def reset():
@@ -197,8 +259,7 @@ with st.sidebar:
     mto_file = st.file_uploader("2. MTO Consolidated Master", type=["xlsx", "csv"])
     mta_file = st.file_uploader("3. MTA Consolidated Master", type=["xlsx", "csv"])
     box_file = st.file_uploader("4. Size–Box Master", type=["xlsx", "csv"])
-    st.caption("Daily demand is calculated automatically from the MTO Master + Size–Box Master. No separate daily-demand file is required.")
-
+    st.caption("Daily demand is derived automatically from the MTO Master + Size–Box Master.")
     st.divider()
     st.subheader("Model 1 physical controls")
     pw = st.number_input("Pallet width (m)", .1, 5., 1.2, .05)
@@ -209,11 +270,6 @@ with st.sidebar:
     cross = st.number_input("Cross aisle (m)", 0., 10., 2., .25)
     speed = st.number_input("Forklift speed (m/s)", .1, 10., 2.5, .1)
     handle = st.number_input("Handling time (sec/pallet)", 0., 600., 0., 5.)
-
-    st.divider()
-    st.subheader("Model 2")
-    strategy = st.selectbox("Strategy", ["Frequency priority", "Volume priority", "Frequency × volume"])
-    density = st.number_input("Scenario density (belts/slot)", 1., 100000., 300., 50., help="Scenario parameter only; not an observed inventory capacity.")
     if st.button("Reset all", use_container_width=True):
         reset()
 
@@ -288,30 +344,14 @@ if st.button("▶ Generate physical slots", type="primary", use_container_width=
             demand_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
             daily_demand.to_csv(demand_path.name, index=False)
             demand_path.close()
-            r = run_pipeline(
-                st.session_state.cad_path, demand_path.name,
-                manual_door_xy=(dx, dy), pallet_width_m=pw, pallet_depth_m=pd_,
-                wall_clearance_m=wall, main_aisle_m=aisle, cross_aisle_m=cross,
-                turning_diameter_m=td, turning_enabled=ton,
-                turning_center_xy=(turn.x, turn.y) if turn else None,
-                target_occupancy_pct=occ, forklift_speed_mps=speed,
-                handling_time_sec_per_pallet=handle,
-            )
+            r = run_pipeline(st.session_state.cad_path, demand_path.name, manual_door_xy=(dx, dy), pallet_width_m=pw, pallet_depth_m=pd_, wall_clearance_m=wall, main_aisle_m=aisle, cross_aisle_m=cross, turning_diameter_m=td, turning_enabled=ton, turning_center_xy=(turn.x, turn.y) if turn else None, target_occupancy_pct=occ, forklift_speed_mps=speed, handling_time_sec_per_pallet=handle)
             r["derived_daily_demand"] = daily_demand
             r["demand_detail"] = demand_detail
-            r["config"] = {
-                "pallet_width_m": pw, "pallet_depth_m": pd_, "wall_clearance_m": wall,
-                "main_aisle_m": aisle, "cross_aisle_m": cross, "turning_enabled": ton,
-                "turning_diameter_m": td if ton else 0, "turning_center_x_m": turn.x if turn else None,
-                "turning_center_y_m": turn.y if turn else None, "target_occupancy_pct": occ,
-                "forklift_speed_mps": speed, "handling_time_sec_per_pallet": handle,
-                "operating_door_x_m": dx, "operating_door_y_m": dy, "door_source": door_source,
-                "daily_demand_source": "Derived from MTO Consolidated Master + Size–Box Master",
-            }
+            r["config"] = {"pallet_width_m":pw,"pallet_depth_m":pd_,"wall_clearance_m":wall,"main_aisle_m":aisle,"cross_aisle_m":cross,"turning_enabled":ton,"turning_diameter_m":td if ton else 0,"turning_center_x_m":turn.x if turn else None,"turning_center_y_m":turn.y if turn else None,"target_occupancy_pct":occ,"forklift_speed_mps":speed,"handling_time_sec_per_pallet":handle,"operating_door_x_m":dx,"operating_door_y_m":dy,"door_source":door_source,"daily_demand_source":"Derived from MTO Consolidated Master + Size–Box Master"}
             st.session_state.m1_result = r
             st.session_state.pop("area_range", None)
             st.session_state.pop("area_region", None)
-            st.session_state.pop("scenario_result", None)
+            st.session_state.pop("frequency_result", None)
         st.success(f"Model 1 completed: {len(r['slot_df']):,} feasible slots.")
     except Exception as e:
         st.error(f"Model 1 failed: {e}")
@@ -319,85 +359,72 @@ if st.button("▶ Generate physical slots", type="primary", use_container_width=
 if "m1_result" in st.session_state:
     r = st.session_state.m1_result
     st.header("4 — Select the exact study area")
-    st.info("Choose the Box Select tool (▭) in the chart toolbar, then drag a rectangle over the exact warehouse area you want to improve. The next section appears automatically after a valid selection.")
-
-    event = st.plotly_chart(
-        m1_plot(r, "SELECT STUDY AREA — Box Select", True),
-        use_container_width=True,
-        key="area_selector",
-        on_select="rerun",
-        selection_mode="box",
-    )
+    st.info("Choose Box Select (▭) in the chart toolbar and drag a rectangle over the exact area you want to improve. Model 2 will use only the Model 1 slots inside that rectangle.")
+    event = st.plotly_chart(m1_plot(r, "SELECT STUDY AREA — Box Select", True), use_container_width=True, key="area_selector", on_select="rerun", selection_mode="box")
     rr = event_range(event)
-
     if rr is not None:
         st.session_state.area_range = rr
         st.session_state.area_region = r["warehouse"].intersection(sbox(rr[0], rr[2], rr[1], rr[3]))
-
     if st.session_state.get("area_range"):
         rr = st.session_state.area_range
         region = st.session_state.area_region
         slots = slots_in(r["slot_df"], region)
         st.success(f"Study area selected: X {rr[0]:.2f}–{rr[1]:.2f} m · Y {rr[2]:.2f}–{rr[3]:.2f} m · **{len(slots):,} existing Model 1 slots**")
-
         if len(slots) == 0:
-            st.warning("No Model 1 slots are inside this rectangle. Drag a rectangle around an area containing the generated slot markers.")
+            st.warning("No Model 1 slots are inside this rectangle. Select an area containing generated slot markers.")
         else:
-            st.header("5 — Selected-area Model 1 simulation")
-            daily, occupancy, sim_summary = selected_sim(r, slots)
-            c1, c2, c3, c4 = st.columns(4)
+            st.header("5 — Selected-area Model 1 flow simulation")
+            daily = r["derived_daily_demand"].copy()
+            peak = int(daily["TOTAL_PALLETS"].max()) if not daily.empty else 0
+            avg = float(daily["TOTAL_PALLETS"].mean()) if not daily.empty else 0
+            c1,c2,c3,c4 = st.columns(4)
             c1.metric("Selected Model 1 slots", len(slots))
-            c2.metric("Planning capacity", int(len(slots) * occ / 100))
-            c3.metric("Peak daily pallets", int(daily["PALLETS"].max()) if len(daily) else 0)
-            c4.metric("Overflow days", int((daily["OVERFLOW"] > 0).sum()) if len(daily) else 0)
+            c2.metric("Average daily pallets", f"{avg:.1f}")
+            c3.metric("Peak daily pallets", peak)
+            c4.metric("Operating days", len(daily))
             st.dataframe(daily, use_container_width=True)
 
-            st.header("6 — Model 2: movement-based slotting")
-            if st.button("▶ Run Model 2 scenarios", type="primary", use_container_width=True):
+            st.header("6 — Model 2: Frequency Matrix Slotting + Daily Flow")
+            st.markdown("**Rule:** one existing Model 1 slot is assigned to each prioritized SKU. Closest-to-door slots receive the highest movement priority. No belts/slot assumption is used.")
+            if st.button("▶ Run Frequency Matrix + Daily Flow Simulation", type="primary", use_container_width=True):
                 try:
-                    with st.spinner("Analysing MTO + MTA movement and allocating only the selected Model 1 slots…"):
-                        sku, mto_clean, mta_clean, box_clean = prepare_movement(st.session_state["mto_path"], st.session_state["mta_path"], st.session_state["box_path"])
-                        ranked = sku.copy()
-                        if strategy == "Frequency priority":
-                            ranked["STRATEGY_SCORE"] = ranked["FREQUENCY_SCORE"]
-                        elif strategy == "Volume priority":
-                            ranked["STRATEGY_SCORE"] = ranked["MTO_BELTS"]
-                        else:
-                            f = ranked["FREQUENCY_SCORE"] / max(float(ranked["FREQUENCY_SCORE"].max()), 1)
-                            v = ranked["MTO_BELTS"] / max(float(ranked["MTO_BELTS"].max()), 1)
-                            ranked["STRATEGY_SCORE"] = np.sqrt(f * v)
-                        ranked = ranked.sort_values(["STRATEGY_SCORE", "MTO_BELTS"], ascending=False).reset_index(drop=True)
-                        allocations = []
-                        slot_list = slots.reset_index(drop=True)
-                        pos = 0
-                        for rank, row in ranked.iterrows():
-                            required = max(int(np.ceil(float(row["MTO_BELTS"]) / density)), 1)
-                            for j in range(required):
-                                out = {"SKU_RANK": rank + 1, "ITEM_SIZE": row["ITEM_SIZE"], "STRATEGY_SCORE": row["STRATEGY_SCORE"], "SLOTS_REQUIRED_FOR_SKU": required, "SLOT_WITHIN_SKU": j + 1}
-                                if pos < len(slot_list):
-                                    s = slot_list.iloc[pos]
-                                    out.update({"SLOT_ID": s["SLOT_ID"], "X_M": s["X_M"], "Y_M": s["Y_M"], "DISTANCE_FROM_DOOR_M": s["DISTANCE_FROM_DOOR_M"], "STATUS": "ALLOCATED"})
-                                    pos += 1
-                                else:
-                                    out.update({"SLOT_ID": None, "X_M": np.nan, "Y_M": np.nan, "DISTANCE_FROM_DOOR_M": np.nan, "STATUS": "OVERFLOW"})
-                                allocations.append(out)
-                        allocation = pd.DataFrame(allocations)
-                        allocated = allocation[allocation.STATUS == "ALLOCATED"]
-                        comparison = pd.DataFrame([{
-                            "STRATEGY": strategy, "SELECTED_MODEL1_SLOTS": len(slots),
-                            "ALLOCATED_SLOTS": len(allocated),
-                            "OVERFLOW_SLOT_EQUIVALENTS": int((allocation.STATUS == "OVERFLOW").sum()),
-                            "SLOT_UTILIZATION_PCT": len(allocated) / len(slots) * 100,
-                            "BELTS_PER_SLOT_SCENARIO": density,
-                        }])
-                        st.session_state.scenario_result = {"sku": sku, "allocation": allocation, "comparison": comparison}
+                    with st.spinner("Building the frequency matrix, assigning the selected Model 1 slots and replaying daily MTO flow…"):
+                        sku, freq_cut, vol_cut = build_frequency_matrix(r["demand_detail"])
+                        allocation = assign_frequency_slots(sku, slots)
+                        flow, daily_flow, summary = simulate_daily_flow(r["demand_detail"], allocation, daily)
+                        st.session_state.frequency_result = {"sku":sku,"allocation":allocation,"flow":flow,"daily_flow":daily_flow,"summary":summary,"freq_cut":freq_cut,"vol_cut":vol_cut}
                 except Exception as e:
-                    st.error(f"Model 2 failed: {e}")
+                    st.error(f"Frequency Matrix simulation failed: {e}")
 
-            if "scenario_result" in st.session_state:
-                sc = st.session_state.scenario_result
-                st.dataframe(sc["comparison"], use_container_width=True)
-                st.dataframe(sc["allocation"].head(500), use_container_width=True)
+            if "frequency_result" in st.session_state:
+                fr = st.session_state.frequency_result
+                summary = fr["summary"]
+                st.success(f"Frequency Matrix simulation completed: {summary['assigned_skus']:,} SKUs assigned to {summary['available_slots']:,} selected physical slots.")
+                st.write(f"**Frequency threshold:** {fr['freq_cut']:.0f} active days (median)  |  **Volume threshold:** {fr['vol_cut']:.1f} MTO belts (median)")
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Assigned SKUs", summary["assigned_skus"])
+                c2.metric("Flow-line coverage", f"{summary['line_coverage_pct']:.1f}%")
+                c3.metric("Belt-flow coverage", f"{summary['belt_coverage_pct']:.1f}%")
+                c4.metric("One-way travel", f"{summary['total_one_way_travel_m']:,.0f} m")
+
+                st.subheader("Frequency matrix")
+                matrix = fr["sku"].groupby(["FREQUENCY_CLASS","VOLUME_CLASS"], as_index=False).agg(SKUs=("ITEM_SIZE","count"), MTO_BELTS=("MTO_BELTS","sum"), MTO_LINES=("MTO_LINES","sum"))
+                st.dataframe(matrix, use_container_width=True)
+
+                st.subheader("Selected Model 1 slots with frequency assignment")
+                st.dataframe(fr["allocation"], use_container_width=True)
+                st.plotly_chart(m1_plot(r, "MODEL 2 — Frequency-matrix allocation inside selected Model 1 area", False, fr["allocation"]), use_container_width=True)
+
+                st.subheader("Daily flow simulation")
+                st.dataframe(fr["daily_flow"], use_container_width=True)
+                fig = go.Figure()
+                df = fr["daily_flow"]
+                fig.add_trace(go.Scatter(x=df["DATE"], y=df["EST_ONE_WAY_TRAVEL_M"], mode="lines+markers", name="Estimated one-way travel (m)"))
+                fig.update_layout(height=450, title="Daily MTO flow → estimated travel from assigned frequency-priority slots", xaxis_title="Date", yaxis_title="Travel distance (m)")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.subheader("Interpretation")
+                st.info("The simulation replays the historical daily MTO flow through the assigned SKU locations. Travel is based on each SKU's Model 1 slot distance from the operating door. This is a flow/workload scenario, not an inventory-capacity claim.")
 
                 st.header("7 — Download outputs")
                 zbuf = io.BytesIO()
@@ -406,8 +433,9 @@ if "m1_result" in st.session_state:
                     z.writestr("02_Daily_Demand_Detail.csv", r["demand_detail"].to_csv(index=False))
                     z.writestr("03_Model1_Full_Slot_Master.csv", r["slot_df"].to_csv(index=False))
                     z.writestr("04_Selected_Area_Slot_Master.csv", slots.to_csv(index=False))
-                    z.writestr("05_Selected_Area_Daily_Simulation.csv", daily.to_csv(index=False))
-                    z.writestr("06_SKU_Movement_Master.csv", sc["sku"].to_csv(index=False))
-                    z.writestr("07_Model2_Allocation.csv", sc["allocation"].to_csv(index=False))
-                    z.writestr("08_Model2_Comparison.csv", sc["comparison"].to_csv(index=False))
-                st.download_button("⬇ Download ZIP — all outputs", zbuf.getvalue(), "JK_Fenner_Selected_Area_Digital_Twin_Output.zip", "application/zip", type="primary", use_container_width=True)
+                    z.writestr("05_Frequency_Matrix_SKU_Master.csv", fr["sku"].to_csv(index=False))
+                    z.writestr("06_Frequency_Matrix_Slot_Assignment.csv", fr["allocation"].to_csv(index=False))
+                    z.writestr("07_Daily_Flow_Simulation.csv", fr["daily_flow"].to_csv(index=False))
+                    z.writestr("08_MTO_Flow_With_Assigned_Slots.csv", fr["flow"].to_csv(index=False))
+                    z.writestr("09_Model_Parameters.csv", pd.DataFrame([r["config"]]).to_csv(index=False))
+                st.download_button("⬇ Download ZIP — Model 1 + Frequency Matrix + Daily Flow", zbuf.getvalue(), "JK_Fenner_Frequency_Matrix_Daily_Flow_Output.zip", "application/zip", type="primary", use_container_width=True)
