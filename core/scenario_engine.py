@@ -12,15 +12,42 @@ DEFAULT_BELTS_PER_BOX = 25
 
 
 def load_table(path):
+    """Load CSV or the most relevant Excel sheet.
+
+    JK Fenner's MTO workbook contains both invoice-level and packing-list
+    sheets. The invoice sheet has quantity/date columns but does not contain
+    the SKU/item-size field required by Model 2. Therefore Excel sheets are
+    scored against the fields used by the Model 2 loaders and the sheet with
+    the strongest match is selected instead of blindly taking the first sheet.
+    """
     path = Path(path)
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
     if path.suffix.lower() in {".xlsx", ".xls"}:
         xl = pd.ExcelFile(path)
+        candidate_names = {
+            "ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE",
+            "NO_OF_BELTS", "BELTS", "QUANTITY", "QTY",
+            "DATE", "PACKING_DATE", "INVOICE_DATE",
+            "INVOICE_ID", "INVOICE", "DOCUMENT_NO",
+            "UNITS PER BOX", "UNITS_PER_BOX", "BELTS_PER_BOX",
+            "BOX_QTY", "BOX QUANTITY",
+        }
+        best_df = None
+        best_score = -1
+        best_rows = -1
         for sheet in xl.sheet_names:
             df = pd.read_excel(path, sheet_name=sheet)
-            if not df.empty:
-                return df
+            if df.empty:
+                continue
+            normalized = {str(c).strip().upper() for c in df.columns}
+            score = len(normalized & candidate_names)
+            if score > best_score or (score == best_score and len(df) > best_rows):
+                best_df = df
+                best_score = score
+                best_rows = len(df)
+        if best_df is not None:
+            return best_df
     raise ValueError("File must be CSV or Excel and contain a non-empty sheet.")
 
 
@@ -30,7 +57,9 @@ def _find_col(df, names, required=True):
         if name.upper() in lookup:
             return lookup[name.upper()]
     if required:
-        raise ValueError(f"Could not find any of columns: {names}")
+        raise ValueError(
+            f"Could not find any of columns: {names}. Available columns: {list(df.columns)}"
+        )
     return None
 
 
@@ -44,7 +73,6 @@ def prepare_box_master(box_path):
     out["MASTER_BELTS_PER_BOX"] = pd.to_numeric(out["MASTER_BELTS_PER_BOX"], errors="coerce")
     out = out[out["ITEM_SIZE"].notna()].copy()
 
-    # Keep only a single unambiguous positive standard per SKU.
     grouped = out.groupby("ITEM_SIZE")["MASTER_BELTS_PER_BOX"].agg(
         lambda s: sorted(set(float(x) for x in s.dropna() if float(x) > 0))
     )
