@@ -1,4 +1,4 @@
-"""JK Fenner Warehouse Digital Twin — Model 1 physical twin + Model 2 frequency slotting."""
+"""JK Fenner Warehouse Digital Twin — Model 1 physical twin + comparative Model 2 slotting."""
 from pathlib import Path
 import io
 import tempfile
@@ -14,7 +14,7 @@ from core.pipeline import prepare_cad, run_pipeline
 
 st.set_page_config(page_title="JK Fenner Warehouse Digital Twin", page_icon="🏭", layout="wide")
 st.title("🏭 JK Fenner Warehouse Digital Twin")
-st.caption("CAD → physical slots → exact study area → frequency-matrix slotting → daily flow simulation")
+st.caption("CAD → physical slots → study area → Model 1 dashboard → comparative SKU slotting")
 
 FALLBACK_BELTS_PER_BOX = 28
 
@@ -101,12 +101,13 @@ def m1_plot(r, title="Model 1 — generated physical slots", selectable=False, a
         fig.add_trace(go.Scatter(x=list(x), y=list(y), mode="lines", fill="toself", opacity=.2, showlegend=False))
     s = r["slot_df"].copy()
     if allocation is not None and not allocation.empty:
-        a = allocation.dropna(subset=["SLOT_ID"])[["SLOT_ID","FREQUENCY_CLASS","MOVEMENT_SEGMENT","ITEM_SIZE","FREQUENCY_RANK"]].drop_duplicates("SLOT_ID")
+        cols = ["SLOT_ID", "ITEM_SIZE", "STRATEGY", "RANK", "MOVEMENT_SEGMENT"]
+        a = allocation[[c for c in cols if c in allocation.columns]].drop_duplicates("SLOT_ID")
         s = s.merge(a, on="SLOT_ID", how="left")
         assigned = s[s["ITEM_SIZE"].notna()]
         unassigned = s[s["ITEM_SIZE"].isna()]
-        fig.add_trace(go.Scatter(x=unassigned.X_M, y=unassigned.Y_M, mode="markers", marker=dict(size=7, symbol="square-open"), name="Unassigned Model 1 slots", hovertemplate="%{x:.2f}, %{y:.2f}<extra></extra>"))
-        fig.add_trace(go.Scatter(x=assigned.X_M, y=assigned.Y_M, mode="markers", marker=dict(size=9, symbol="square"), name="Frequency-assigned slots", customdata=np.c_[assigned.SLOT_ID,assigned.ITEM_SIZE,assigned.FREQUENCY_RANK,assigned.MOVEMENT_SEGMENT], hovertemplate="Slot %{customdata[0]}<br>%{customdata[1]}<br>Frequency rank: %{customdata[2]}<br>%{customdata[3]}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=unassigned.X_M, y=unassigned.Y_M, mode="markers", marker=dict(size=7, symbol="square-open"), name="Unassigned Model 1 slots"))
+        fig.add_trace(go.Scatter(x=assigned.X_M, y=assigned.Y_M, mode="markers", marker=dict(size=9, symbol="square"), name="Assigned slots", customdata=np.c_[assigned.SLOT_ID, assigned.ITEM_SIZE, assigned.RANK, assigned.MOVEMENT_SEGMENT], hovertemplate="Slot %{customdata[0]}<br>SKU %{customdata[1]}<br>Rank %{customdata[2]}<br>%{customdata[3]}<extra></extra>"))
     else:
         fig.add_trace(go.Scatter(x=s.X_M, y=s.Y_M, mode="markers", marker=dict(size=6, symbol="square-open"), name="Model 1 slots", customdata=s.SLOT_ID, hovertemplate="%{customdata}<br>X=%{x:.2f}<br>Y=%{y:.2f}<extra></extra>"))
     d = r["door"]
@@ -153,7 +154,10 @@ def slots_in(df, region):
     return df[mask].copy().sort_values("DISTANCE_FROM_DOOR_M").reset_index(drop=True)
 
 
-def build_frequency_matrix(mto_detail):
+# --------------------------- Model 2 ---------------------------
+
+def build_sku_master(mto_detail):
+    """Build the evidence table used by all three Model 2 strategies."""
     d = mto_detail[["DATE", "ITEM_SIZE", "BELTS"]].copy()
     d["ITEM_SIZE"] = d["ITEM_SIZE"].astype("string").str.strip().str.upper()
     d["BELTS"] = pd.to_numeric(d["BELTS"], errors="coerce")
@@ -165,87 +169,116 @@ def build_frequency_matrix(mto_detail):
         ACTIVE_DAYS=("DATE", "nunique"),
         ACTIVE_MONTHS=("DATE", lambda x: x.dt.to_period("M").nunique()),
         AVG_BELTS_PER_LINE=("BELTS", "mean"),
+        MAX_BELTS_PER_LINE=("BELTS", "max"),
     )
-    freq_cut = float(sku["ACTIVE_DAYS"].median())
-    vol_cut = float(sku["MTO_BELTS"].median())
-    sku["FREQUENCY_CLASS"] = np.where(sku["ACTIVE_DAYS"] >= freq_cut, "High Frequency", "Low Frequency")
-    sku["VOLUME_CLASS"] = np.where(sku["MTO_BELTS"] >= vol_cut, "High Volume", "Low Volume")
+    sku["MOVEMENT_SHARE_PCT"] = sku["MTO_BELTS"] / max(float(sku["MTO_BELTS"].sum()), 1.0) * 100
+    # Frequency is transaction occurrence, not a simultaneous inventory quantity.
+    sku["FREQUENCY_RANK"] = sku["MTO_LINES"].rank(method="min", ascending=False).astype(int)
+    sku["VOLUME_RANK"] = sku["MTO_BELTS"].rank(method="min", ascending=False).astype(int)
+    sku["FREQUENCY_SCORE"] = sku["MTO_LINES"].rank(method="average", pct=True)
+    sku["VOLUME_SCORE"] = sku["MTO_BELTS"].rank(method="average", pct=True)
+    sku["COMBINED_SCORE"] = 0.5 * sku["FREQUENCY_SCORE"] + 0.5 * sku["VOLUME_SCORE"]
+    sku["FREQUENCY_CLASS"] = np.where(sku["MTO_LINES"] >= sku["MTO_LINES"].quantile(.75), "High Frequency", "Standard Frequency")
+    sku["VOLUME_CLASS"] = np.where(sku["MTO_BELTS"] >= sku["MTO_BELTS"].quantile(.75), "High Volume", "Standard Volume")
     sku["MOVEMENT_SEGMENT"] = sku["FREQUENCY_CLASS"] + " / " + sku["VOLUME_CLASS"]
-    priority = {
-        "High Frequency / High Volume": 1,
-        "High Frequency / Low Volume": 2,
-        "Low Frequency / High Volume": 3,
-        "Low Frequency / Low Volume": 4,
-    }
-    sku["MATRIX_PRIORITY"] = sku["MOVEMENT_SEGMENT"].map(priority)
-    sku = sku.sort_values(["MATRIX_PRIORITY", "ACTIVE_DAYS", "MTO_BELTS", "MTO_LINES"], ascending=[True, False, False, False]).reset_index(drop=True)
-    sku["FREQUENCY_RANK"] = np.arange(1, len(sku) + 1)
-    return sku, freq_cut, vol_cut
+    return sku.sort_values(["COMBINED_SCORE", "MTO_LINES", "MTO_BELTS"], ascending=False).reset_index(drop=True)
 
 
-def assign_frequency_slots(sku, slots):
-    """One physical Model 1 slot per prioritized SKU; no belts/slot assumption."""
+def strategy_ranking(sku, strategy):
+    if strategy == "Frequency":
+        ranked = sku.sort_values(["MTO_LINES", "ACTIVE_DAYS", "MTO_BELTS", "ITEM_SIZE"], ascending=[False, False, False, True]).copy()
+        score_col = "FREQUENCY_SCORE"
+    elif strategy == "Volume":
+        ranked = sku.sort_values(["MTO_BELTS", "MTO_LINES", "ACTIVE_DAYS", "ITEM_SIZE"], ascending=[False, False, False, True]).copy()
+        score_col = "VOLUME_SCORE"
+    else:
+        ranked = sku.sort_values(["COMBINED_SCORE", "MTO_LINES", "MTO_BELTS", "ITEM_SIZE"], ascending=[False, False, False, True]).copy()
+        score_col = "COMBINED_SCORE"
+    ranked = ranked.reset_index(drop=True)
+    ranked["RANK"] = np.arange(1, len(ranked) + 1)
+    ranked["STRATEGY_SCORE"] = ranked[score_col]
+    ranked["STRATEGY"] = strategy
+    return ranked
+
+
+def allocate_strategy(ranked, slots):
     slots = slots.sort_values("DISTANCE_FROM_DOOR_M").reset_index(drop=True).copy()
-    n = min(len(slots), len(sku))
-    ranked = sku.head(n).copy()
-    out = slots.head(n).copy()
-    out["ITEM_SIZE"] = ranked["ITEM_SIZE"].to_numpy()
-    out["FREQUENCY_RANK"] = ranked["FREQUENCY_RANK"].to_numpy()
-    out["ACTIVE_DAYS"] = ranked["ACTIVE_DAYS"].to_numpy()
-    out["MTO_LINES"] = ranked["MTO_LINES"].to_numpy()
-    out["MTO_BELTS"] = ranked["MTO_BELTS"].to_numpy()
-    out["FREQUENCY_CLASS"] = ranked["FREQUENCY_CLASS"].to_numpy()
-    out["VOLUME_CLASS"] = ranked["VOLUME_CLASS"].to_numpy()
-    out["MOVEMENT_SEGMENT"] = ranked["MOVEMENT_SEGMENT"].to_numpy()
-    out["MATRIX_PRIORITY"] = ranked["MATRIX_PRIORITY"].to_numpy()
-    out["STATUS"] = "ASSIGNED"
-    return out
+    n = min(len(slots), len(ranked))
+    a = slots.head(n).copy()
+    s = ranked.head(n).copy()
+    a["ITEM_SIZE"] = s["ITEM_SIZE"].to_numpy()
+    a["RANK"] = s["RANK"].to_numpy()
+    a["STRATEGY"] = s["STRATEGY"].to_numpy()
+    a["STRATEGY_SCORE"] = s["STRATEGY_SCORE"].to_numpy()
+    a["MTO_LINES"] = s["MTO_LINES"].to_numpy()
+    a["MTO_BELTS"] = s["MTO_BELTS"].to_numpy()
+    a["ACTIVE_DAYS"] = s["ACTIVE_DAYS"].to_numpy()
+    a["MOVEMENT_SHARE_PCT"] = s["MOVEMENT_SHARE_PCT"].to_numpy()
+    a["FREQUENCY_CLASS"] = s["FREQUENCY_CLASS"].to_numpy()
+    a["VOLUME_CLASS"] = s["VOLUME_CLASS"].to_numpy()
+    a["MOVEMENT_SEGMENT"] = s["MOVEMENT_SEGMENT"].to_numpy()
+    return a
 
 
-def simulate_daily_flow(mto_detail, allocation, total_daily):
-    """Replay historical MTO flow through the assigned SKU locations day by day."""
+def simulate_strategy(mto_detail, allocation, strategy):
     flow = mto_detail[["DATE", "ITEM_SIZE", "BELTS"]].copy()
     flow["ITEM_SIZE"] = flow["ITEM_SIZE"].astype("string").str.strip().str.upper()
     flow["BELTS"] = pd.to_numeric(flow["BELTS"], errors="coerce")
     flow = flow.dropna(subset=["DATE", "ITEM_SIZE", "BELTS"])
     flow = flow[flow["BELTS"] > 0].copy()
-    a = allocation[["ITEM_SIZE", "SLOT_ID", "X_M", "Y_M", "DISTANCE_FROM_DOOR_M", "FREQUENCY_RANK", "MOVEMENT_SEGMENT"]].copy()
-    flow = flow.merge(a, on="ITEM_SIZE", how="left")
+    cols = ["ITEM_SIZE", "SLOT_ID", "X_M", "Y_M", "DISTANCE_FROM_DOOR_M", "RANK", "STRATEGY"]
+    flow = flow.merge(allocation[cols], on="ITEM_SIZE", how="left")
     flow["ASSIGNED"] = flow["SLOT_ID"].notna()
-    flow["TRAVEL_DISTANCE_M"] = flow["DISTANCE_FROM_DOOR_M"].fillna(0)
-    flow["TRAVEL_DISTANCE_ASSIGNED_M"] = np.where(flow["ASSIGNED"], flow["DISTANCE_FROM_DOOR_M"], 0)
+    flow["ASSIGNED_TRAVEL_M"] = np.where(flow["ASSIGNED"], flow["DISTANCE_FROM_DOOR_M"], 0.0)
+    flow["BELT_WEIGHTED_TRAVEL_M"] = flow["BELTS"] * flow["ASSIGNED_TRAVEL_M"]
     daily = flow.groupby("DATE", as_index=False).agg(
         FLOW_LINES=("ITEM_SIZE", "size"),
         FLOW_BELTS=("BELTS", "sum"),
         ASSIGNED_LINES=("ASSIGNED", "sum"),
-        ASSIGNED_BELTS=("BELTS", lambda s: float(s[flow.loc[s.index, "ASSIGNED"]].sum())),
-        EST_ONE_WAY_TRAVEL_M=("TRAVEL_DISTANCE_ASSIGNED_M", "sum"),
-        ASSIGNED_SKUS=("ITEM_SIZE", lambda s: int(flow.loc[s.index & flow["ASSIGNED"], "ITEM_SIZE"].nunique()) if False else 0),
+        ASSIGNED_BELTS=("BELTS", lambda x: float(x[flow.loc[x.index, "ASSIGNED"]].sum())),
+        EST_ONE_WAY_TRAVEL_M=("ASSIGNED_TRAVEL_M", "sum"),
+        BELT_WEIGHTED_TRAVEL_M=("BELT_WEIGHTED_TRAVEL_M", "sum"),
+        ASSIGNED_SKUS=("ITEM_SIZE", lambda x: x[flow.loc[x.index, "ASSIGNED"]].nunique()),
     )
-    # Recalculate assigned SKU count and percentages cleanly.
-    sku_count = flow[flow["ASSIGNED"]].groupby("DATE")["ITEM_SIZE"].nunique().rename("ASSIGNED_SKUS")
-    daily = daily.drop(columns=["ASSIGNED_SKUS"]).merge(sku_count, on="DATE", how="left").fillna({"ASSIGNED_SKUS": 0})
-    daily["ASSIGNED_LINES"] = daily["ASSIGNED_LINES"].astype(int)
     daily["UNASSIGNED_LINES"] = daily["FLOW_LINES"] - daily["ASSIGNED_LINES"]
     daily["UNASSIGNED_BELTS"] = daily["FLOW_BELTS"] - daily["ASSIGNED_BELTS"]
-    daily["FLOW_COVERAGE_BY_LINES_%"] = daily["ASSIGNED_LINES"] / daily["FLOW_LINES"].replace(0, np.nan) * 100
-    daily["FLOW_COVERAGE_BY_BELTS_%"] = daily["ASSIGNED_BELTS"] / daily["FLOW_BELTS"].replace(0, np.nan) * 100
+    daily["LINE_COVERAGE_PCT"] = daily["ASSIGNED_LINES"] / daily["FLOW_LINES"].replace(0, np.nan) * 100
+    daily["BELT_COVERAGE_PCT"] = daily["ASSIGNED_BELTS"] / daily["FLOW_BELTS"].replace(0, np.nan) * 100
     daily["AVG_TRAVEL_M_PER_ASSIGNED_LINE"] = daily["EST_ONE_WAY_TRAVEL_M"] / daily["ASSIGNED_LINES"].replace(0, np.nan)
-    daily = daily.sort_values("DATE").reset_index(drop=True)
+    daily["STRATEGY"] = strategy
+    total_lines = len(flow)
+    total_belts = float(flow["BELTS"].sum())
+    assigned = flow[flow["ASSIGNED"]]
+    total_travel = float(assigned["ASSIGNED_TRAVEL_M"].sum())
+    weighted_travel = float(assigned["BELT_WEIGHTED_TRAVEL_M"].sum())
+    assigned_lines = int(assigned.shape[0])
+    assigned_belts = float(assigned["BELTS"].sum())
     summary = {
-        "operating_days": int(len(daily)),
-        "assigned_skus": int(allocation["ITEM_SIZE"].nunique()),
-        "available_slots": int(len(allocation)),
-        "flow_lines": int(flow.shape[0]),
-        "assigned_lines": int(flow["ASSIGNED"].sum()),
-        "line_coverage_pct": float(flow["ASSIGNED"].mean() * 100),
-        "flow_belts": float(flow["BELTS"].sum()),
-        "assigned_belts": float(flow.loc[flow["ASSIGNED"], "BELTS"].sum()),
-        "belt_coverage_pct": float(flow.loc[flow["ASSIGNED"], "BELTS"].sum() / max(flow["BELTS"].sum(), 1) * 100),
-        "total_one_way_travel_m": float(flow["TRAVEL_DISTANCE_ASSIGNED_M"].sum()),
-        "avg_one_way_m_per_assigned_line": float(flow.loc[flow["ASSIGNED"], "DISTANCE_FROM_DOOR_M"].mean()),
+        "Strategy": strategy,
+        "Assigned SKUs": int(allocation["ITEM_SIZE"].nunique()),
+        "Available Model 1 slots": int(len(allocation)),
+        "Historical flow lines": int(total_lines),
+        "Assigned flow lines": assigned_lines,
+        "Line coverage %": assigned_lines / max(total_lines, 1) * 100,
+        "Historical MTO belts": total_belts,
+        "Assigned MTO belts": assigned_belts,
+        "Belt coverage %": assigned_belts / max(total_belts, 1) * 100,
+        "Total one-way travel m": total_travel,
+        "Avg one-way m / assigned line": total_travel / max(assigned_lines, 1),
+        "Belt-weighted travel m": weighted_travel,
+        "Avg slot distance m": float(assigned["DISTANCE_FROM_DOOR_M"].mean()) if assigned_lines else 0.0,
+        "Max assigned slot distance m": float(assigned["DISTANCE_FROM_DOOR_M"].max()) if assigned_lines else 0.0,
     }
     return flow, daily, summary
+
+
+def compare_strategies(summary_df):
+    x = summary_df.copy()
+    # Equal-weight decision score: movement coverage + volume coverage + travel efficiency.
+    x["Travel_Efficiency"] = 1 - (x["Total one-way travel m"] - x["Total one-way travel m"].min()) / max(x["Total one-way travel m"].max() - x["Total one-way travel m"].min(), 1e-9)
+    x["Balanced_Performance_Score"] = (x["Line coverage %"] / 100 + x["Belt coverage %"] / 100 + x["Travel_Efficiency"]) / 3 * 100
+    x["Overall_Rank"] = x["Balanced_Performance_Score"].rank(method="min", ascending=False).astype(int)
+    return x.sort_values("Overall_Rank").reset_index(drop=True)
 
 
 def reset():
@@ -259,7 +292,7 @@ with st.sidebar:
     mto_file = st.file_uploader("2. MTO Consolidated Master", type=["xlsx", "csv"])
     mta_file = st.file_uploader("3. MTA Consolidated Master", type=["xlsx", "csv"])
     box_file = st.file_uploader("4. Size–Box Master", type=["xlsx", "csv"])
-    st.caption("Daily demand is derived automatically from the MTO Master + Size–Box Master.")
+    st.caption("Daily demand and Model 2 flow are derived from the MTO Master + Size–Box Master.")
     st.divider()
     st.subheader("Model 1 physical controls")
     pw = st.number_input("Pallet width (m)", .1, 5., 1.2, .05)
@@ -351,7 +384,7 @@ if st.button("▶ Generate physical slots", type="primary", use_container_width=
             st.session_state.m1_result = r
             st.session_state.pop("area_range", None)
             st.session_state.pop("area_region", None)
-            st.session_state.pop("frequency_result", None)
+            st.session_state.pop("model2_result", None)
         st.success(f"Model 1 completed: {len(r['slot_df']):,} feasible slots.")
     except Exception as e:
         st.error(f"Model 1 failed: {e}")
@@ -359,7 +392,7 @@ if st.button("▶ Generate physical slots", type="primary", use_container_width=
 if "m1_result" in st.session_state:
     r = st.session_state.m1_result
     st.header("4 — Select the exact study area")
-    st.info("Choose Box Select (▭) in the chart toolbar and drag a rectangle over the exact area you want to improve. Model 2 will use only the Model 1 slots inside that rectangle.")
+    st.info("Choose Box Select (▭) in the chart toolbar and drag a rectangle over the exact area you want to improve. Model 2 uses the physical slots produced by Model 1 inside that selected area.")
     event = st.plotly_chart(m1_plot(r, "SELECT STUDY AREA — Box Select", True), use_container_width=True, key="area_selector", on_select="rerun", selection_mode="box")
     rr = event_range(event)
     if rr is not None:
@@ -373,7 +406,7 @@ if "m1_result" in st.session_state:
         if len(slots) == 0:
             st.warning("No Model 1 slots are inside this rectangle. Select an area containing generated slot markers.")
         else:
-            st.header("5 — Selected-area Model 1 flow simulation")
+            st.header("5 — Selected-area Model 1 flow dashboard")
             daily = r["derived_daily_demand"].copy()
             peak = int(daily["TOTAL_PALLETS"].max()) if not daily.empty else 0
             avg = float(daily["TOTAL_PALLETS"].mean()) if not daily.empty else 0
@@ -383,59 +416,118 @@ if "m1_result" in st.session_state:
             c3.metric("Peak daily pallets", peak)
             c4.metric("Operating days", len(daily))
             st.dataframe(daily, use_container_width=True)
+            fig5 = go.Figure()
+            fig5.add_trace(go.Scatter(x=daily["DATE"], y=daily["TOTAL_PALLETS"], mode="lines+markers", name="Daily pallets"))
+            fig5.update_layout(height=400, title="Daily pallet flow used by Model 1", xaxis_title="Date", yaxis_title="Pallets")
+            st.plotly_chart(fig5, use_container_width=True)
 
-            st.header("6 — Model 2: Frequency Matrix Slotting + Daily Flow")
-            st.markdown("**Rule:** one existing Model 1 slot is assigned to each prioritized SKU. Closest-to-door slots receive the highest movement priority. No belts/slot assumption is used.")
-            if st.button("▶ Run Frequency Matrix + Daily Flow Simulation", type="primary", use_container_width=True):
+            st.header("6 — Model 2: Comparative SKU Slotting Analysis")
+            st.markdown("Model 2 uses the **physical slot count produced by Process 4**. It does not create an independent storage capacity assumption. Three SKU strategies are tested on the same Process-4 output: **Frequency**, **Volume**, and **Frequency + Volume**.")
+            st.caption("Frequency = MTO transaction-line occurrence. Volume = total MTO belts. Combined = equal-weight normalized frequency and volume scores. The same physical slots and historical MTO flow are used for all three scenarios.")
+            if st.button("▶ Run all 3 Model 2 strategies", type="primary", use_container_width=True):
                 try:
-                    with st.spinner("Building the frequency matrix, assigning the selected Model 1 slots and replaying daily MTO flow…"):
-                        sku, freq_cut, vol_cut = build_frequency_matrix(r["demand_detail"])
-                        allocation = assign_frequency_slots(sku, slots)
-                        flow, daily_flow, summary = simulate_daily_flow(r["demand_detail"], allocation, daily)
-                        st.session_state.frequency_result = {"sku":sku,"allocation":allocation,"flow":flow,"daily_flow":daily_flow,"summary":summary,"freq_cut":freq_cut,"vol_cut":vol_cut}
+                    with st.spinner("Ranking SKUs, assigning the Process-4 physical slots and replaying the historical MTO flow for all three strategies…"):
+                        sku_master = build_sku_master(r["demand_detail"])
+                        results = {}
+                        summaries = []
+                        for strategy in ["Frequency", "Volume", "Frequency + Volume"]:
+                            ranked = strategy_ranking(sku_master, strategy)
+                            allocation = allocate_strategy(ranked, slots)
+                            flow, daily_flow, summary = simulate_strategy(r["demand_detail"], allocation, strategy)
+                            results[strategy] = {"ranked": ranked, "allocation": allocation, "flow": flow, "daily": daily_flow, "summary": summary}
+                            summaries.append(summary)
+                        comparison = compare_strategies(pd.DataFrame(summaries))
+                        st.session_state.model2_result = {"sku_master": sku_master, "results": results, "comparison": comparison, "slots": slots}
                 except Exception as e:
-                    st.error(f"Frequency Matrix simulation failed: {e}")
+                    st.error(f"Model 2 failed: {e}")
 
-            if "frequency_result" in st.session_state:
-                fr = st.session_state.frequency_result
-                summary = fr["summary"]
-                st.success(f"Frequency Matrix simulation completed: {summary['assigned_skus']:,} SKUs assigned to {summary['available_slots']:,} selected physical slots.")
-                st.write(f"**Frequency threshold:** {fr['freq_cut']:.0f} active days (median)  |  **Volume threshold:** {fr['vol_cut']:.1f} MTO belts (median)")
+            if "model2_result" in st.session_state:
+                m2 = st.session_state.model2_result
+                comparison = m2["comparison"]
+                winner = comparison.iloc[0]
+                st.success(f"Recommended strategy from the comparative model: **{winner['Strategy']}** — Balanced Performance Score {winner['Balanced_Performance_Score']:.1f}/100.")
+
+                st.subheader("Model 2 decision dashboard")
                 c1,c2,c3,c4 = st.columns(4)
-                c1.metric("Assigned SKUs", summary["assigned_skus"])
-                c2.metric("Flow-line coverage", f"{summary['line_coverage_pct']:.1f}%")
-                c3.metric("Belt-flow coverage", f"{summary['belt_coverage_pct']:.1f}%")
-                c4.metric("One-way travel", f"{summary['total_one_way_travel_m']:,.0f} m")
+                c1.metric("Best frequency SKU", m2["results"]["Frequency"]["ranked"].iloc[0]["ITEM_SIZE"])
+                c2.metric("Best volume SKU", m2["results"]["Volume"]["ranked"].iloc[0]["ITEM_SIZE"])
+                c3.metric("Best combined SKU", m2["results"]["Frequency + Volume"]["ranked"].iloc[0]["ITEM_SIZE"])
+                c4.metric("Recommended strategy", winner["Strategy"])
 
-                st.subheader("Frequency matrix")
-                matrix = fr["sku"].groupby(["FREQUENCY_CLASS","VOLUME_CLASS"], as_index=False).agg(SKUs=("ITEM_SIZE","count"), MTO_BELTS=("MTO_BELTS","sum"), MTO_LINES=("MTO_LINES","sum"))
-                st.dataframe(matrix, use_container_width=True)
+                st.subheader("Strategy comparison")
+                display_cols = ["Strategy", "Assigned SKUs", "Line coverage %", "Belt coverage %", "Total one-way travel m", "Avg one-way m / assigned line", "Belt-weighted travel m", "Balanced_Performance_Score", "Overall_Rank"]
+                st.dataframe(comparison[display_cols].round(3), use_container_width=True)
 
-                st.subheader("Selected Model 1 slots with frequency assignment")
-                st.dataframe(fr["allocation"], use_container_width=True)
-                st.plotly_chart(m1_plot(r, "MODEL 2 — Frequency-matrix allocation inside selected Model 1 area", False, fr["allocation"]), use_container_width=True)
+                fig_cov = go.Figure()
+                fig_cov.add_trace(go.Bar(x=comparison["Strategy"], y=comparison["Line coverage %"], name="Line coverage %"))
+                fig_cov.add_trace(go.Bar(x=comparison["Strategy"], y=comparison["Belt coverage %"], name="Belt coverage %"))
+                fig_cov.update_layout(height=430, barmode="group", title="Historical MTO flow coverage by strategy", yaxis_title="Coverage (%)")
+                st.plotly_chart(fig_cov, use_container_width=True)
 
-                st.subheader("Daily flow simulation")
-                st.dataframe(fr["daily_flow"], use_container_width=True)
-                fig = go.Figure()
-                df = fr["daily_flow"]
-                fig.add_trace(go.Scatter(x=df["DATE"], y=df["EST_ONE_WAY_TRAVEL_M"], mode="lines+markers", name="Estimated one-way travel (m)"))
-                fig.update_layout(height=450, title="Daily MTO flow → estimated travel from assigned frequency-priority slots", xaxis_title="Date", yaxis_title="Travel distance (m)")
-                st.plotly_chart(fig, use_container_width=True)
+                fig_travel = go.Figure()
+                fig_travel.add_trace(go.Bar(x=comparison["Strategy"], y=comparison["Total one-way travel m"], name="Total one-way travel"))
+                fig_travel.update_layout(height=430, title="Estimated one-way travel for assigned historical flow", yaxis_title="Distance (m)")
+                st.plotly_chart(fig_travel, use_container_width=True)
 
-                st.subheader("Interpretation")
-                st.info("The simulation replays the historical daily MTO flow through the assigned SKU locations. Travel is based on each SKU's Model 1 slot distance from the operating door. This is a flow/workload scenario, not an inventory-capacity claim.")
+                fig_score = go.Figure()
+                fig_score.add_trace(go.Bar(x=comparison["Strategy"], y=comparison["Balanced_Performance_Score"], name="Balanced Performance Score"))
+                fig_score.update_layout(height=430, title="Overall comparative score", yaxis_title="Score (0–100)", yaxis_range=[0,100])
+                st.plotly_chart(fig_score, use_container_width=True)
 
-                st.header("7 — Download outputs")
+                st.subheader("Best SKU under each strategy")
+                champions = []
+                for strategy in ["Frequency", "Volume", "Frequency + Volume"]:
+                    top = m2["results"][strategy]["ranked"].iloc[0]
+                    champions.append({"Strategy":strategy,"Best SKU":top["ITEM_SIZE"],"Rank":1,"MTO Lines":top["MTO_LINES"],"MTO Belts":top["MTO_BELTS"],"Active Days":top["ACTIVE_DAYS"],"Movement Share %":top["MOVEMENT_SHARE_PCT"],"Strategy Score":top["STRATEGY_SCORE"]})
+                st.dataframe(pd.DataFrame(champions).round(3), use_container_width=True)
+
+                st.subheader("SKU ranking analysis")
+                for strategy in ["Frequency", "Volume", "Frequency + Volume"]:
+                    with st.expander(f"{strategy} — top 25 SKUs", expanded=(strategy == winner["Strategy"])):
+                        st.dataframe(m2["results"][strategy]["ranked"].head(25), use_container_width=True)
+
+                st.subheader("Physical allocation by strategy")
+                selected_strategy = st.selectbox("View strategy", ["Frequency", "Volume", "Frequency + Volume"], index=["Frequency", "Volume", "Frequency + Volume"].index(winner["Strategy"]))
+                selected = m2["results"][selected_strategy]
+                st.dataframe(selected["allocation"], use_container_width=True)
+                st.plotly_chart(m1_plot(r, f"MODEL 2 — {selected_strategy} allocation using Process-4 slots", False, selected["allocation"]), use_container_width=True)
+
+                st.subheader("Daily simulation analysis")
+                daily_frames = []
+                for strategy in ["Frequency", "Volume", "Frequency + Volume"]:
+                    daily_frames.append(m2["results"][strategy]["daily"])
+                all_daily = pd.concat(daily_frames, ignore_index=True)
+                st.dataframe(all_daily, use_container_width=True)
+                fig_daily = go.Figure()
+                for strategy in ["Frequency", "Volume", "Frequency + Volume"]:
+                    df = m2["results"][strategy]["daily"]
+                    fig_daily.add_trace(go.Scatter(x=df["DATE"], y=df["EST_ONE_WAY_TRAVEL_M"], mode="lines", name=strategy))
+                fig_daily.update_layout(height=450, title="Daily estimated travel under the three slotting strategies", xaxis_title="Date", yaxis_title="One-way travel (m)")
+                st.plotly_chart(fig_daily, use_container_width=True)
+
+                st.subheader("Model 2 interpretation")
+                st.info("The three scenarios use the same physical slots produced by Process 4 and replay the same historical MTO flow. The comparison therefore isolates the effect of SKU ranking/slot assignment. Travel is Euclidean distance from the operating door to the assigned Model 1 slot; it is a comparative workload indicator, not a measured route distance.")
+
+                st.header("7 — Download complete Model 2 analysis")
                 zbuf = io.BytesIO()
                 with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
                     z.writestr("01_Derived_Daily_Demand.csv", r["derived_daily_demand"].to_csv(index=False))
                     z.writestr("02_Daily_Demand_Detail.csv", r["demand_detail"].to_csv(index=False))
                     z.writestr("03_Model1_Full_Slot_Master.csv", r["slot_df"].to_csv(index=False))
-                    z.writestr("04_Selected_Area_Slot_Master.csv", slots.to_csv(index=False))
-                    z.writestr("05_Frequency_Matrix_SKU_Master.csv", fr["sku"].to_csv(index=False))
-                    z.writestr("06_Frequency_Matrix_Slot_Assignment.csv", fr["allocation"].to_csv(index=False))
-                    z.writestr("07_Daily_Flow_Simulation.csv", fr["daily_flow"].to_csv(index=False))
-                    z.writestr("08_MTO_Flow_With_Assigned_Slots.csv", fr["flow"].to_csv(index=False))
-                    z.writestr("09_Model_Parameters.csv", pd.DataFrame([r["config"]]).to_csv(index=False))
-                st.download_button("⬇ Download ZIP — Model 1 + Frequency Matrix + Daily Flow", zbuf.getvalue(), "JK_Fenner_Frequency_Matrix_Daily_Flow_Output.zip", "application/zip", type="primary", use_container_width=True)
+                    z.writestr("04_Process4_Selected_Area_Slot_Master.csv", slots.to_csv(index=False))
+                    z.writestr("05_Model2_SKU_Master.csv", m2["sku_master"].to_csv(index=False))
+                    z.writestr("06_Model2_Strategy_Comparison.csv", comparison.to_csv(index=False))
+                    for i, strategy in enumerate(["Frequency", "Volume", "Frequency + Volume"], 7):
+                        res = m2["results"][strategy]
+                        safe = strategy.replace(" ", "_").replace("+", "plus")
+                        z.writestr(f"{i:02d}_{safe}_SKU_Ranking.csv", res["ranked"].to_csv(index=False))
+                        z.writestr(f"{i:02d}_{safe}_Slot_Allocation.csv", res["allocation"].to_csv(index=False))
+                        z.writestr(f"{i:02d}_{safe}_Flow_Detail.csv", res["flow"].to_csv(index=False))
+                        z.writestr(f"{i:02d}_{safe}_Daily_Simulation.csv", res["daily"].to_csv(index=False))
+                        z.writestr(f"{i:02d}_{safe}_Summary.csv", pd.DataFrame([res["summary"]]).to_csv(index=False))
+                    z.writestr("20_Best_SKU_By_Strategy.csv", pd.DataFrame(champions).to_csv(index=False))
+                    z.writestr("21_Model1_Parameters.csv", pd.DataFrame([r["config"]]).to_csv(index=False))
+                    z.writestr("22_Graph_Data_Strategy_Comparison.csv", comparison[["Strategy","Line coverage %","Belt coverage %","Total one-way travel m","Balanced_Performance_Score"]].to_csv(index=False))
+                    z.writestr("23_Graph_Data_Daily_Travel.csv", all_daily.to_csv(index=False))
+                    z.writestr("24_Graph_Data_Top_SKUs.csv", pd.concat([m2["results"][s]["ranked"].head(25).assign(STRATEGY=s) for s in ["Frequency","Volume","Frequency + Volume"]], ignore_index=True).to_csv(index=False))
+                st.download_button("⬇ Download ZIP — Complete Model 1 + Model 2 Analysis", zbuf.getvalue(), "JK_Fenner_Comparative_Model2_Complete_Analysis.zip", "application/zip", type="primary", use_container_width=True)
