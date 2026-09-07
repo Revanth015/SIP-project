@@ -1,6 +1,7 @@
 """Visualization engine for warehouse layout and scenario allocation."""
 
 from pathlib import Path
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -49,7 +50,7 @@ def plot_layout(warehouse, storage_region, slots, door, main_aisle=None, turning
         ax.add_patch(Rectangle((x1, y1), x2-x1, y2-y1, facecolor="tab:green" if occupied else "none", edgecolor="gray", linewidth=0.35, alpha=0.72 if occupied else 1.0))
     if door is not None:
         ax.scatter([door.x], [door.y], s=130, marker="*", zorder=20, label="Selected door")
-    ax.set_aspect("equal", adjustable="box"); ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m"); ax.set_title(title, fontsize=13, weight="bold"); ax.grid(alpha=0.12); ax.legend(fontsize=8, loc="best"); fig.tight_layout()
+    ax.set_aspect("equal", adjustable="box"); ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_title(title, fontsize=13, weight="bold"); ax.grid(alpha=0.12); ax.legend(fontsize=8, loc="best"); fig.tight_layout()
     return fig
 
 
@@ -59,13 +60,11 @@ def plot_slot_allocation(warehouse, analysis_region, slots, allocation, door, ti
     _draw_polygon(ax, warehouse, linewidth=2.2, label="Warehouse")
     if analysis_region is not None:
         _draw_polygon(ax, analysis_region, linestyle="--", linewidth=2.0, label="Selected analysis area")
-
     cmap = plt.get_cmap("tab20")
     sku_colors = {}
     if allocation is not None and not allocation.empty:
         for sku in allocation.loc[allocation["STATUS"] == "ALLOCATED", "ITEM_SIZE"].dropna().unique():
             sku_colors[sku] = cmap(len(sku_colors) % 20)
-
     alloc_xy = allocation.dropna(subset=["X_M", "Y_M"]).copy() if allocation is not None and not allocation.empty else pd.DataFrame()
     for slot in slots:
         cx, cy = slot.centroid.x, slot.centroid.y
@@ -79,12 +78,9 @@ def plot_slot_allocation(warehouse, analysis_region, slots, allocation, door, ti
         if candidate is not None:
             face = sku_colors.get(candidate["ITEM_SIZE"], "tab:blue")
             ax.add_patch(Rectangle((x1, y1), x2-x1, y2-y1, facecolor=face, edgecolor="black", linewidth=0.55, alpha=0.82))
-            label = str(candidate["ITEM_SIZE"])
-            # Use a short label when the SKU is long; the full SKU remains in the allocation table.
-            ax.text(cx, cy, label[:14], ha="center", va="center", fontsize=5.5, clip_on=True)
+            ax.text(cx, cy, str(candidate["ITEM_SIZE"])[:14], ha="center", va="center", fontsize=5.5, clip_on=True)
         else:
             ax.add_patch(Rectangle((x1, y1), x2-x1, y2-y1, facecolor="none", edgecolor="gray", linewidth=0.4))
-
     if door is not None:
         ax.scatter([door.x], [door.y], s=140, marker="*", zorder=20, label="Operating door")
     ax.set_aspect("equal", adjustable="box"); ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_title(title, fontsize=13, weight="bold"); ax.grid(alpha=0.10); fig.tight_layout()
