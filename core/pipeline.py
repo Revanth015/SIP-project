@@ -1,9 +1,4 @@
-"""End-to-end orchestration for the Universal Warehouse Digital Twin.
-
-The pipeline coordinates the independent engines while keeping each engine
-unit-testable. The UI can call one function instead of duplicating the model
-sequence.
-"""
+"""End-to-end orchestration for the Universal Warehouse Digital Twin."""
 
 from pathlib import Path
 
@@ -46,6 +41,8 @@ def run_pipeline(
     main_aisle_m=4.00,
     cross_aisle_m=2.00,
     turning_diameter_m=7.00,
+    turning_enabled=True,
+    turning_center_xy=None,
     target_occupancy_pct=65.0,
     forklift_speed_mps=2.5,
     handling_time_sec_per_pallet=0.0,
@@ -69,6 +66,11 @@ def run_pipeline(
     storage_region = warehouse
     obstacles = cad.get("obstacles", [])
 
+    if turning_center_xy is not None:
+        turning_center = Point(float(turning_center_xy[0]), float(turning_center_xy[1]))
+    else:
+        turning_center = door
+
     layout_cfg = LayoutConfig(
         pallet_width_m=pallet_width_m,
         pallet_depth_m=pallet_depth_m,
@@ -88,6 +90,9 @@ def run_pipeline(
         wall_clearance_options=(wall_clearance_m,),
         main_aisle_options=(main_aisle_m,),
         cross_aisle_options=(cross_aisle_m,),
+        turning_enabled=turning_enabled,
+        turning_center=turning_center,
+        turning_diameter_m=turning_diameter_m,
     )
 
     slots = winner["layout"]["slots"]
@@ -116,14 +121,9 @@ def run_pipeline(
         handling_time_sec_per_pallet=handling_time_sec_per_pallet,
         target_occupancy_pct=target_occupancy_pct,
     )
-    daily_df, occupancy_df = simulate_daily(
-        demand, slots_df, realistic, planning, sim_cfg
-    )
+    daily_df, occupancy_df = simulate_daily(demand, slots_df, realistic, planning, sim_cfg)
     sim_summary = simulation_summary(daily_df)
-    sim_summary["average_storage_usage_pct"] = (
-        float(daily_df["STORAGE_USAGE_%"].mean()) if not daily_df.empty else 0.0
-    )
-
+    sim_summary["average_storage_usage_pct"] = float(daily_df["STORAGE_USAGE_%"].mean()) if not daily_df.empty else 0.0
     dmetrics = demand_metrics(demand, realistic, planning)
 
     return {
@@ -134,6 +134,9 @@ def run_pipeline(
         "doors": doors,
         "selected_door": selected_door,
         "door": door,
+        "turning_enabled": turning_enabled,
+        "turning_center": turning_center,
+        "turning_diameter_m": turning_diameter_m if turning_enabled else 0.0,
         "layout_config": layout_cfg,
         "theoretical": theoretical,
         "winner": winner,
