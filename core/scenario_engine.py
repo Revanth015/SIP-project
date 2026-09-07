@@ -8,6 +8,8 @@ import math
 import numpy as np
 import pandas as pd
 
+DEFAULT_BELTS_PER_BOX = 25
+
 
 def load_table(path):
     path = Path(path)
@@ -32,8 +34,31 @@ def _find_col(df, names, required=True):
     return None
 
 
-def prepare_movement(mto_path, mta_path=None):
-    """Clean raw MTO/MTA files and build an SKU movement master."""
+def prepare_box_master(box_path):
+    """Prepare SKU packing standards; use 25 belts/box where no valid standard exists."""
+    raw = load_table(box_path).copy()
+    sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE"])
+    box_col = _find_col(raw, ["UNITS PER BOX", "UNITS_PER_BOX", "BELTS_PER_BOX", "BOX_QTY", "BOX QUANTITY"])
+    out = raw[[sku_col, box_col]].copy().rename(columns={sku_col: "ITEM_SIZE", box_col: "MASTER_BELTS_PER_BOX"})
+    out["ITEM_SIZE"] = out["ITEM_SIZE"].astype("string").str.strip()
+    out["MASTER_BELTS_PER_BOX"] = pd.to_numeric(out["MASTER_BELTS_PER_BOX"], errors="coerce")
+    out = out[out["ITEM_SIZE"].notna()].copy()
+
+    # Keep only a single unambiguous positive standard per SKU.
+    grouped = out.groupby("ITEM_SIZE")["MASTER_BELTS_PER_BOX"].agg(
+        lambda s: sorted(set(float(x) for x in s.dropna() if float(x) > 0))
+    )
+    rows = []
+    for item, values in grouped.items():
+        if len(values) == 1:
+            rows.append((item, values[0], "Master"))
+        else:
+            rows.append((item, float(DEFAULT_BELTS_PER_BOX), "Default = 25"))
+    return pd.DataFrame(rows, columns=["ITEM_SIZE", "BELTS_PER_BOX", "BELTS_PER_BOX_SOURCE"])
+
+
+def prepare_movement(mto_path, mta_path, box_path):
+    """Clean the three supplied Model 2 files and build the SKU movement master."""
     mto = load_table(mto_path).copy()
     sku_col = _find_col(mto, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
     qty_col = _find_col(mto, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
@@ -47,22 +72,20 @@ def prepare_movement(mto_path, mta_path=None):
     mto = mto.drop_duplicates().copy()
     mto = mto[mto["ITEM_SIZE"].notna() & mto["BELTS"].notna() & (mto["BELTS"] > 0)].copy()
 
-    mta = pd.DataFrame(columns=["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"])
-    if mta_path:
-        raw = load_table(mta_path).copy()
-        sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
-        qty_col = _find_col(raw, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
-        date_col = _find_col(raw, ["DATE", "PACKING_DATE", "INVOICE_DATE"], required=False)
-        inv_col = _find_col(raw, ["INVOICE_ID", "INVOICE", "DOCUMENT_NO"], required=False)
-        raw = raw.rename(columns={sku_col: "ITEM_SIZE", qty_col: "BELTS"})
-        raw["ITEM_SIZE"] = raw["ITEM_SIZE"].astype("string").str.strip()
-        raw["BELTS"] = pd.to_numeric(raw["BELTS"], errors="coerce")
-        raw["DATE"] = pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True) if date_col else pd.NaT
-        raw["INVOICE_ID"] = raw[inv_col].astype("string") if inv_col else pd.NA
-        raw = raw.drop_duplicates().copy()
-        total_mask = raw["ITEM_SIZE"].astype("string").str.contains("grand total|^total$", case=False, na=False)
-        raw = raw[~total_mask]
-        mta = raw[raw["ITEM_SIZE"].notna() & raw["BELTS"].notna() & (raw["BELTS"] > 0)][["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"]].copy()
+    raw = load_table(mta_path).copy()
+    sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
+    qty_col = _find_col(raw, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
+    date_col = _find_col(raw, ["DATE", "PACKING_DATE", "INVOICE_DATE"], required=False)
+    inv_col = _find_col(raw, ["INVOICE_ID", "INVOICE", "DOCUMENT_NO"], required=False)
+    raw = raw.rename(columns={sku_col: "ITEM_SIZE", qty_col: "BELTS"})
+    raw["ITEM_SIZE"] = raw["ITEM_SIZE"].astype("string").str.strip()
+    raw["BELTS"] = pd.to_numeric(raw["BELTS"], errors="coerce")
+    raw["DATE"] = pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True) if date_col else pd.NaT
+    raw["INVOICE_ID"] = raw[inv_col].astype("string") if inv_col else pd.NA
+    raw = raw.drop_duplicates().copy()
+    total_mask = raw["ITEM_SIZE"].astype("string").str.contains("grand total|^total$", case=False, na=False)
+    raw = raw[~total_mask]
+    mta = raw[raw["ITEM_SIZE"].notna() & raw["BELTS"].notna() & (raw["BELTS"] > 0)][["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"]].copy()
 
     sku = mto.groupby("ITEM_SIZE", as_index=False).agg(
         MTO_BELTS=("BELTS", "sum"), MTO_LINES=("ITEM_SIZE", "size"),
@@ -70,14 +93,11 @@ def prepare_movement(mto_path, mta_path=None):
         ACTIVE_MONTHS=("DATE", lambda x: x.dt.to_period("M").nunique()),
         AVG_BELTS_PER_LINE=("BELTS", "mean"), MAX_BELTS_PER_LINE=("BELTS", "max"),
     )
-    if not mta.empty:
-        mta_sku = mta.groupby("ITEM_SIZE", as_index=False).agg(
-            MTA_BELTS=("BELTS", "sum"), MTA_LINES=("ITEM_SIZE", "size"),
-            MTA_INVOICES=("INVOICE_ID", "nunique"), MTA_ACTIVE_DAYS=("DATE", "nunique"),
-        )
-        sku = sku.merge(mta_sku, on="ITEM_SIZE", how="outer")
-    else:
-        sku["MTA_BELTS"] = 0.0; sku["MTA_LINES"] = 0; sku["MTA_INVOICES"] = 0; sku["MTA_ACTIVE_DAYS"] = 0
+    mta_sku = mta.groupby("ITEM_SIZE", as_index=False).agg(
+        MTA_BELTS=("BELTS", "sum"), MTA_LINES=("ITEM_SIZE", "size"),
+        MTA_INVOICES=("INVOICE_ID", "nunique"), MTA_ACTIVE_DAYS=("DATE", "nunique"),
+    )
+    sku = sku.merge(mta_sku, on="ITEM_SIZE", how="outer")
     numeric = [c for c in sku.columns if c != "ITEM_SIZE"]
     sku[numeric] = sku[numeric].fillna(0)
     sku["TOTAL_MTO_MTA_BELTS"] = sku["MTO_BELTS"] + sku["MTA_BELTS"]
@@ -91,13 +111,20 @@ def prepare_movement(mto_path, mta_path=None):
     sku["VOLUME_CLASS"] = np.where(sku["MTO_BELTS"] >= volume_median, "High Volume", "Low Volume")
     sku["FREQUENCY_CLASS"] = np.where(sku["FREQUENCY_SCORE"] >= frequency_median, "Recurring", "Less Recurring")
     sku["MOVEMENT_SEGMENT"] = sku["FREQUENCY_CLASS"] + " / " + sku["VOLUME_CLASS"]
+
+    box = prepare_box_master(box_path)
+    sku = sku.merge(box, on="ITEM_SIZE", how="left")
+    sku["BELTS_PER_BOX"] = sku["BELTS_PER_BOX"].fillna(DEFAULT_BELTS_PER_BOX)
+    sku["BELTS_PER_BOX_SOURCE"] = sku["BELTS_PER_BOX_SOURCE"].fillna("Default = 25")
+    sku["BOXES_REQUIRED_MTO"] = np.ceil(sku["MTO_BELTS"] / sku["BELTS_PER_BOX"]).astype(int)
+
     sku = sku.sort_values(["MTO_BELTS", "FREQUENCY_SCORE"], ascending=False).reset_index(drop=True)
     sku["VOLUME_RANK"] = np.arange(1, len(sku) + 1)
     freq_order = sku.sort_values(["FREQUENCY_SCORE", "MTO_BELTS"], ascending=False).index
     freq_map = {idx: i + 1 for i, idx in enumerate(freq_order)}
     sku["FREQUENCY_RANK"] = [freq_map[i] for i in sku.index]
     sku["CUMULATIVE_MOVEMENT_SHARE_PCT"] = sku["MTO_BELTS"].cumsum() / max(float(sku["MTO_BELTS"].sum()), 1) * 100
-    return sku, mto, mta
+    return sku, mto, mta, box
 
 
 def rank_skus(sku, strategy):
@@ -125,7 +152,6 @@ def allocate_slots(sku_ranked, slot_df, belts_per_slot):
     rows = []
     slot_pos = 0
     total_slots = len(slots)
-    cumulative_required = 0
     for rank, row in sku_ranked.iterrows():
         required = max(int(math.ceil(float(row["MTO_BELTS"]) / belts_per_slot)), 1)
         for local in range(required):
@@ -133,6 +159,9 @@ def allocate_slots(sku_ranked, slot_df, belts_per_slot):
                 "ALLOCATION_SEQUENCE": len(rows) + 1,
                 "ITEM_SIZE": row["ITEM_SIZE"], "SKU_RANK": rank + 1,
                 "STRATEGY_SCORE": row["STRATEGY_SCORE"],
+                "BELTS_PER_BOX": row["BELTS_PER_BOX"],
+                "BELTS_PER_BOX_SOURCE": row["BELTS_PER_BOX_SOURCE"],
+                "BOXES_REQUIRED_MTO": row["BOXES_REQUIRED_MTO"],
                 "SLOTS_REQUIRED_FOR_SKU": required, "SLOT_WITHIN_SKU": local + 1,
             }
             if slot_pos < total_slots:
@@ -145,11 +174,10 @@ def allocate_slots(sku_ranked, slot_df, belts_per_slot):
                 base.update({"SLOT_ID": None, "STATUS": "OVERFLOW",
                              "X_M": np.nan, "Y_M": np.nan, "DISTANCE_FROM_DOOR_M": np.nan})
             rows.append(base)
-        cumulative_required += required
+
     allocation = pd.DataFrame(rows)
     allocated = allocation[allocation["STATUS"] == "ALLOCATED"]
     overflow = allocation[allocation["STATUS"] == "OVERFLOW"]
-
     cumulative = 0
     fully_covered = []
     for _, row in sku_ranked.iterrows():
