@@ -31,32 +31,32 @@ def sample_slots():
     )
 
 
-def test_prepare_sku_demand_creates_storage_requirements():
-    sku = prepare_sku_demand(sample_mto(), capacity_units=1.0, safety_buffer=0.0)
-    assert {"MTO_LINES", "MTO_BELTS", "PEAK_PALLET_EQ", "REQUIRED_LOCATIONS"}.issubset(sku.columns)
+def test_prepare_sku_demand_creates_movement_master():
+    sku = prepare_sku_demand(sample_mto())
+    assert {"MTO_LINES", "MTO_BELTS", "FREQUENCY_SCORE", "VOLUME_SCORE", "MOVEMENT_SPACE_SCORE"}.issubset(sku.columns)
     assert set(sku["ITEM_SIZE"]) == {"A", "B", "C"}
     assert int(sku.loc[sku["ITEM_SIZE"] == "A", "MTO_LINES"].iloc[0]) == 2
 
 
-def test_shared_locations_are_allowed_under_capacity():
-    sku = prepare_sku_demand(sample_mto(), capacity_units=1.0, safety_buffer=0.0)
+def test_shared_locations_are_allowed():
+    sku = prepare_sku_demand(sample_mto())
     ranked = sku.copy()
     ranked["RANK"] = range(1, len(ranked) + 1)
     ranked["STRATEGY"] = "Movement + Space"
     ranked["STRATEGY_SCORE"] = ranked["MOVEMENT_SPACE_SCORE"]
-    allocation, locations = allocate_shared_locations(ranked, sample_slots(), capacity_units=1.0)
+    allocation, locations = allocate_shared_locations(ranked, sample_slots(), max_skus_per_location=2)
     assert not allocation.empty
-    assert locations["ASSIGNED_SKUS"].max() >= 1
-    assert (locations["USED_STORAGE_EQ"] <= 1.0 + 1e-9).all()
+    assert locations["ASSIGNED_SKUS"].max() <= 2
+    assert locations["ASSIGNED_SKUS"].max() == 2
 
 
 def test_all_strategies_use_the_same_physical_location_count():
     mto = sample_mto()
     slots = sample_slots()
-    sku = prepare_sku_demand(mto, capacity_units=1.0, safety_buffer=0.0)
+    sku = prepare_sku_demand(mto)
     counts = []
     for strategy in STRATEGIES:
-        _, _, _, summary = evaluate_strategy(mto, slots, sku, strategy, capacity_units=1.0)
+        _, _, _, summary = evaluate_strategy(mto, slots, sku, strategy, max_skus_per_location=2)
         counts.append(summary["Available physical locations"])
     assert counts == [3, 3, 3, 3]
 
@@ -64,8 +64,8 @@ def test_all_strategies_use_the_same_physical_location_count():
 def test_replay_flow_returns_daily_results():
     mto = sample_mto()
     slots = sample_slots()
-    sku = prepare_sku_demand(mto, capacity_units=1.0, safety_buffer=0.0)
-    _, allocation, _, _ = evaluate_strategy(mto, slots, sku, "Movement + Space", capacity_units=1.0)
+    sku = prepare_sku_demand(mto)
+    _, allocation, _, _ = evaluate_strategy(mto, slots, sku, "Movement + Space", max_skus_per_location=2)
     flow, daily = replay_flow(mto, allocation)
     assert len(flow) == len(mto)
     assert len(daily) == 2
