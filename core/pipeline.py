@@ -142,6 +142,7 @@ def run_pipeline(
         "slot_df": slots_df,
         "demand": demand,
         "daily_df": daily_df,
+        "daily_simulation": daily_df,
         "occupancy_df": occupancy_df,
         "capacity": cap,
         "capacity_table": cap_table,
