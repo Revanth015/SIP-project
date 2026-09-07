@@ -8,34 +8,25 @@ import math
 import numpy as np
 import pandas as pd
 
-DEFAULT_BELTS_PER_BOX = 25
+# Project-documented fallback used when a SKU has no unique master standard.
+DEFAULT_BELTS_PER_BOX = 28
 
 
 def load_table(path):
-    """Load CSV or the most relevant Excel sheet.
-
-    JK Fenner's MTO workbook contains both invoice-level and packing-list
-    sheets. The invoice sheet has quantity/date columns but does not contain
-    the SKU/item-size field required by Model 2. Therefore Excel sheets are
-    scored against the fields used by the Model 2 loaders and the sheet with
-    the strongest match is selected instead of blindly taking the first sheet.
-    """
     path = Path(path)
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
     if path.suffix.lower() in {".xlsx", ".xls"}:
         xl = pd.ExcelFile(path)
         candidate_names = {
-            "ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE",
+            "ITEM_SIZE", "BELT_SIZE", "BELT SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE",
             "NO_OF_BELTS", "BELTS", "QUANTITY", "QTY",
             "DATE", "PACKING_DATE", "INVOICE_DATE",
             "INVOICE_ID", "INVOICE", "DOCUMENT_NO",
             "UNITS PER BOX", "UNITS_PER_BOX", "BELTS_PER_BOX",
             "BOX_QTY", "BOX QUANTITY",
         }
-        best_df = None
-        best_score = -1
-        best_rows = -1
+        best_df, best_score, best_rows = None, -1, -1
         for sheet in xl.sheet_names:
             df = pd.read_excel(path, sheet_name=sheet)
             if df.empty:
@@ -43,9 +34,7 @@ def load_table(path):
             normalized = {str(c).strip().upper() for c in df.columns}
             score = len(normalized & candidate_names)
             if score > best_score or (score == best_score and len(df) > best_rows):
-                best_df = df
-                best_score = score
-                best_rows = len(df)
+                best_df, best_score, best_rows = df, score, len(df)
         if best_df is not None:
             return best_df
     raise ValueError("File must be CSV or Excel and contain a non-empty sheet.")
@@ -54,22 +43,22 @@ def load_table(path):
 def _find_col(df, names, required=True):
     lookup = {str(c).strip().upper(): c for c in df.columns}
     for name in names:
-        if name.upper() in lookup:
-            return lookup[name.upper()]
+        key = name.strip().upper()
+        if key in lookup:
+            return lookup[key]
     if required:
-        raise ValueError(
-            f"Could not find any of columns: {names}. Available columns: {list(df.columns)}"
-        )
+        raise ValueError(f"Could not find any of columns: {names}. Available columns: {list(df.columns)}")
     return None
 
 
 def prepare_box_master(box_path):
-    """Prepare SKU packing standards; use 25 belts/box where no valid standard exists."""
+    """Prepare SKU packing standards from the supplied Size–Box Master."""
     raw = load_table(box_path).copy()
-    sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE"])
-    box_col = _find_col(raw, ["UNITS PER BOX", "UNITS_PER_BOX", "BELTS_PER_BOX", "BOX_QTY", "BOX QUANTITY"])
+    # The actual workbook uses 'Belt Size' and 'Units Per Box'.
+    sku_col = _find_col(raw, ["Belt Size", "ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID", "SIZE"])
+    box_col = _find_col(raw, ["Units Per Box", "UNITS_PER_BOX", "BELTS_PER_BOX", "BOX_QTY", "BOX QUANTITY"])
     out = raw[[sku_col, box_col]].copy().rename(columns={sku_col: "ITEM_SIZE", box_col: "MASTER_BELTS_PER_BOX"})
-    out["ITEM_SIZE"] = out["ITEM_SIZE"].astype("string").str.strip()
+    out["ITEM_SIZE"] = out["ITEM_SIZE"].astype("string").str.strip().str.upper()
     out["MASTER_BELTS_PER_BOX"] = pd.to_numeric(out["MASTER_BELTS_PER_BOX"], errors="coerce")
     out = out[out["ITEM_SIZE"].notna()].copy()
 
@@ -79,41 +68,33 @@ def prepare_box_master(box_path):
     rows = []
     for item, values in grouped.items():
         if len(values) == 1:
-            rows.append((item, values[0], "Master"))
+            rows.append((item, values[0], "Size–Box Master"))
         else:
-            rows.append((item, float(DEFAULT_BELTS_PER_BOX), "Default = 25"))
+            rows.append((item, float(DEFAULT_BELTS_PER_BOX), f"Fallback = {DEFAULT_BELTS_PER_BOX}"))
     return pd.DataFrame(rows, columns=["ITEM_SIZE", "BELTS_PER_BOX", "BELTS_PER_BOX_SOURCE"])
 
 
-def prepare_movement(mto_path, mta_path, box_path):
-    """Clean the three supplied Model 2 files and build the SKU movement master."""
-    mto = load_table(mto_path).copy()
-    sku_col = _find_col(mto, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
-    qty_col = _find_col(mto, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
-    date_col = _find_col(mto, ["DATE", "PACKING_DATE", "INVOICE_DATE"], required=False)
-    inv_col = _find_col(mto, ["INVOICE_ID", "INVOICE", "DOCUMENT_NO"], required=False)
-    mto = mto.rename(columns={sku_col: "ITEM_SIZE", qty_col: "BELTS"})
-    mto["ITEM_SIZE"] = mto["ITEM_SIZE"].astype("string").str.strip()
-    mto["BELTS"] = pd.to_numeric(mto["BELTS"], errors="coerce")
-    mto["DATE"] = pd.to_datetime(mto[date_col], errors="coerce", dayfirst=True) if date_col else pd.NaT
-    mto["INVOICE_ID"] = mto[inv_col].astype("string") if inv_col else pd.NA
-    mto = mto.drop_duplicates().copy()
-    mto = mto[mto["ITEM_SIZE"].notna() & mto["BELTS"].notna() & (mto["BELTS"] > 0)].copy()
-
-    raw = load_table(mta_path).copy()
-    sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "SKU", "LINE_ITEM_SIZE_ID"])
+def _clean_transaction_table(path):
+    raw = load_table(path).copy()
+    sku_col = _find_col(raw, ["ITEM_SIZE", "BELT_SIZE", "Belt Size", "SKU", "LINE_ITEM_SIZE_ID", "SIZE"])
     qty_col = _find_col(raw, ["NO_OF_BELTS", "BELTS", "QUANTITY", "QTY"])
     date_col = _find_col(raw, ["DATE", "PACKING_DATE", "INVOICE_DATE"], required=False)
     inv_col = _find_col(raw, ["INVOICE_ID", "INVOICE", "DOCUMENT_NO"], required=False)
     raw = raw.rename(columns={sku_col: "ITEM_SIZE", qty_col: "BELTS"})
-    raw["ITEM_SIZE"] = raw["ITEM_SIZE"].astype("string").str.strip()
+    raw["ITEM_SIZE"] = raw["ITEM_SIZE"].astype("string").str.strip().str.upper()
     raw["BELTS"] = pd.to_numeric(raw["BELTS"], errors="coerce")
     raw["DATE"] = pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True) if date_col else pd.NaT
     raw["INVOICE_ID"] = raw[inv_col].astype("string") if inv_col else pd.NA
     raw = raw.drop_duplicates().copy()
     total_mask = raw["ITEM_SIZE"].astype("string").str.contains("grand total|^total$", case=False, na=False)
     raw = raw[~total_mask]
-    mta = raw[raw["ITEM_SIZE"].notna() & raw["BELTS"].notna() & (raw["BELTS"] > 0)][["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"]].copy()
+    return raw[raw["ITEM_SIZE"].notna() & raw["BELTS"].notna() & (raw["BELTS"] > 0)][["ITEM_SIZE", "BELTS", "DATE", "INVOICE_ID"]].copy()
+
+
+def prepare_movement(mto_path, mta_path, box_path):
+    """Clean the supplied transaction files and build the SKU movement master."""
+    mto = _clean_transaction_table(mto_path)
+    mta = _clean_transaction_table(mta_path)
 
     sku = mto.groupby("ITEM_SIZE", as_index=False).agg(
         MTO_BELTS=("BELTS", "sum"), MTO_LINES=("ITEM_SIZE", "size"),
@@ -143,7 +124,7 @@ def prepare_movement(mto_path, mta_path, box_path):
     box = prepare_box_master(box_path)
     sku = sku.merge(box, on="ITEM_SIZE", how="left")
     sku["BELTS_PER_BOX"] = sku["BELTS_PER_BOX"].fillna(DEFAULT_BELTS_PER_BOX)
-    sku["BELTS_PER_BOX_SOURCE"] = sku["BELTS_PER_BOX_SOURCE"].fillna("Default = 25")
+    sku["BELTS_PER_BOX_SOURCE"] = sku["BELTS_PER_BOX_SOURCE"].fillna(f"Fallback = {DEFAULT_BELTS_PER_BOX}")
     sku["BOXES_REQUIRED_MTO"] = np.ceil(sku["MTO_BELTS"] / sku["BELTS_PER_BOX"]).astype(int)
 
     sku = sku.sort_values(["MTO_BELTS", "FREQUENCY_SCORE"], ascending=False).reset_index(drop=True)
@@ -194,13 +175,10 @@ def allocate_slots(sku_ranked, slot_df, belts_per_slot):
             }
             if slot_pos < total_slots:
                 s = slots.iloc[slot_pos]
-                base.update({"SLOT_ID": s["SLOT_ID"], "STATUS": "ALLOCATED",
-                             "X_M": s["X_M"], "Y_M": s["Y_M"],
-                             "DISTANCE_FROM_DOOR_M": s["DISTANCE_FROM_DOOR_M"]})
+                base.update({"SLOT_ID": s["SLOT_ID"], "STATUS": "ALLOCATED", "X_M": s["X_M"], "Y_M": s["Y_M"], "DISTANCE_FROM_DOOR_M": s["DISTANCE_FROM_DOOR_M"]})
                 slot_pos += 1
             else:
-                base.update({"SLOT_ID": None, "STATUS": "OVERFLOW",
-                             "X_M": np.nan, "Y_M": np.nan, "DISTANCE_FROM_DOOR_M": np.nan})
+                base.update({"SLOT_ID": None, "STATUS": "OVERFLOW", "X_M": np.nan, "Y_M": np.nan, "DISTANCE_FROM_DOOR_M": np.nan})
             rows.append(base)
 
     allocation = pd.DataFrame(rows)
