@@ -19,8 +19,7 @@ def plot_cad_geometry(cad_data, figsize=(11, 8)):
         points = entity.get("points")
         if not points:
             continue
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
+        xs = [p[0] for p in points]; ys = [p[1] for p in points]
         layer = str(entity.get("layer", "0")).lower()
         linewidth = 2.8 if "warehouse" in layer else 3.5 if any(k in layer for k in ("door", "gate", "entry", "exit")) else 0.8
         ax.plot(xs, ys, linewidth=linewidth, alpha=0.75)
@@ -67,37 +66,28 @@ def plot_slot_allocation(warehouse, analysis_region, slots, allocation, door, ti
         for sku in allocation.loc[allocation["STATUS"] == "ALLOCATED", "ITEM_SIZE"].dropna().unique():
             sku_colors[sku] = cmap(len(sku_colors) % 20)
 
-    alloc_map = {}
-    if allocation is not None and not allocation.empty:
-        alloc_map = allocation.dropna(subset=["SLOT_ID"]).set_index("SLOT_ID").to_dict("index")
-
+    alloc_xy = allocation.dropna(subset=["X_M", "Y_M"]).copy() if allocation is not None and not allocation.empty else pd.DataFrame()
     for slot in slots:
-        sid = None
-        # slot_df is used to map slot geometry by order; allocation carries SLOT_ID.
-        # Match by centroid coordinates when possible.
         cx, cy = slot.centroid.x, slot.centroid.y
         candidate = None
-        if allocation is not None and not allocation.empty:
-            xy = allocation.dropna(subset=["X_M", "Y_M"])
-            if not xy.empty:
-                d = (xy["X_M"] - cx).abs() + (xy["Y_M"] - cy).abs()
-                if float(d.min()) < 1e-6:
-                    candidate = xy.loc[d.idxmin()]
+        if not alloc_xy.empty:
+            d = (alloc_xy["X_M"] - cx).abs() + (alloc_xy["Y_M"] - cy).abs()
+            idx = d.idxmin()
+            if float(d.loc[idx]) < 1e-6:
+                candidate = alloc_xy.loc[idx]
         x1, y1, x2, y2 = slot.bounds
         if candidate is not None:
             face = sku_colors.get(candidate["ITEM_SIZE"], "tab:blue")
-            label = str(candidate["ITEM_SIZE"])
             ax.add_patch(Rectangle((x1, y1), x2-x1, y2-y1, facecolor=face, edgecolor="black", linewidth=0.55, alpha=0.82))
-            ax.text(cx, cy, label, ha="center", va="center", fontsize=5.5, rotation=0, clip_on=True)
+            label = str(candidate["ITEM_SIZE"])
+            # Use a short label when the SKU is long; the full SKU remains in the allocation table.
+            ax.text(cx, cy, label[:14], ha="center", va="center", fontsize=5.5, clip_on=True)
         else:
             ax.add_patch(Rectangle((x1, y1), x2-x1, y2-y1, facecolor="none", edgecolor="gray", linewidth=0.4))
 
     if door is not None:
         ax.scatter([door.x], [door.y], s=140, marker="*", zorder=20, label="Operating door")
-
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_title(title, fontsize=13, weight="bold"); ax.grid(alpha=0.10)
-    fig.tight_layout()
+    ax.set_aspect("equal", adjustable="box"); ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_title(title, fontsize=13, weight="bold"); ax.grid(alpha=0.10); fig.tight_layout()
     return fig
 
 
