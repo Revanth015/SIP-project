@@ -20,7 +20,7 @@ def clean_mto(mto: pd.DataFrame) -> pd.DataFrame:
     d["BELTS"] = pd.to_numeric(d["BELTS"], errors="coerce")
     d["BOXES"] = pd.to_numeric(d.get("BOXES"), errors="coerce")
     if d["BOXES"].isna().any():
-        bp = pd.to_numeric(d.get("BELTS_PER_BOX"), errors="coerce") if "BELTS_PER_BOX" in d else pd.Series(np.nan, index=d.index)
+        bp = pd.to_numeric(d["BELTS_PER_BOX"], errors="coerce") if "BELTS_PER_BOX" in d else pd.Series(np.nan, index=d.index)
         d["BOXES"] = d["BOXES"].fillna(np.ceil(d["BELTS"] / bp.fillna(FALLBACK_BELTS_PER_BOX)))
     d = d.dropna(subset=["DATE", "ITEM_SIZE", "BELTS", "BOXES", "INVOICE_ID", "COMPANY_ID"])
     d = d[(d.BELTS > 0) & (d.BOXES > 0)].copy()
@@ -90,7 +90,8 @@ def sku_cooccurrence(mto: pd.DataFrame, top_n: int = 100) -> pd.DataFrame:
     return p.groupby(["SKU_A", "SKU_B"], as_index=False).agg(SHARED_ORDERS=("ORDER", "nunique")).sort_values("SHARED_ORDERS", ascending=False).head(top_n).reset_index(drop=True)
 
 
-def solve_day(mto: pd.DataFrame, slots: pd.DataFrame, date, time_limit: float = 30):
+def solve_day(mto: pd.DataFrame, slots: pd.DataFrame, date):
+    """Exact three-stage MTO allocation MILP over the existing Process-4 locations."""
     d = clean_mto(mto)
     date = pd.Timestamp(date)
     day = d[d.DATE.dt.normalize() == date.normalize()].copy()
@@ -105,72 +106,66 @@ def solve_day(mto: pd.DataFrame, slots: pd.DataFrame, date, time_limit: float = 
         BOXES=("BOXES", "sum"), BELTS=("BELTS", "sum"), LINES=("ITEM_SIZE", "size"), SKUS=("ITEM_SIZE", "nunique")
     )
     cm = company_master(d)
-    weights = dict(zip(cm.COMPANY_ID.astype(str), cm.PRIORITY_WEIGHT))
-    orders["PRIORITY_WEIGHT"] = orders.COMPANY_ID.astype(str).map(weights).fillna(1)
+    priority_map = dict(zip(cm.COMPANY_ID.astype(str), cm.PRIORITY))
+    orders["PRIORITY"] = orders.COMPANY_ID.astype(str).map(priority_map).fillna(False).astype(bool)
 
     O, L = len(orders), len(slots)
-    # q[o,l] = integer boxes from order o stored at Process-4 pallet position l.
-    # h[o] = boxes held outside the selected area. y[o,l] activates an order/location pair.
     q0 = 0
     h0 = O * L
-    y0 = h0 + O
-    N = y0 + O * L
-    upper = np.r_[np.full(O * L, 32.0), orders.BOXES.to_numpy(float), np.ones(O * L)]
-    bounds = Bounds(np.zeros(N), upper)
+    N = h0 + O
+    bounds = Bounds(np.zeros(N), np.r_[np.full(O * L, float(BOXES_PER_PALLET)), orders.BOXES.to_numpy(float)])
     integrality = np.ones(N)
-    rows, lo, hi = [], [], []
 
-    for o in range(O):
-        rows.append({q0 + o * L + l: 1.0 for l in range(L)} | {h0 + o: 1.0})
-        lo.append(float(orders.iloc[o].BOXES)); hi.append(float(orders.iloc[o].BOXES))
-    for l in range(L):
-        rows.append({q0 + o * L + l: 1.0 for o in range(O)})
-        lo.append(-np.inf); hi.append(32.0)
+    A = lil_matrix((O + L, N), dtype=float)
+    lo, hi = [], []
     for o in range(O):
         for l in range(L):
-            rows.append({q0 + o * L + l: 1.0, y0 + o * L + l: -32.0})
-            lo.append(-np.inf); hi.append(0.0)
-
-    A = lil_matrix((len(rows), N), dtype=float)
-    for r, row in enumerate(rows):
-        for j, v in row.items():
-            A[r, j] = v
+            A[o, q0 + o * L + l] = 1.0
+        A[o, h0 + o] = 1.0
+        lo.append(float(orders.iloc[o].BOXES))
+        hi.append(float(orders.iloc[o].BOXES))
+    for l in range(L):
+        for o in range(O):
+            A[O + l, q0 + o * L + l] = 1.0
+        lo.append(-np.inf)
+        hi.append(float(BOXES_PER_PALLET))
     base = LinearConstraint(A.tocsr(), np.array(lo), np.array(hi))
 
     def run(c, extra=None):
-        constraints = [base] + (extra or [])
-        return milp(c, integrality=integrality, bounds=bounds, constraints=constraints, options={"time_limit": time_limit, "mip_rel_gap": 0.0})
+        return milp(c, integrality=integrality, bounds=bounds, constraints=[base] + (extra or []), options={"mip_rel_gap": 0.0})
 
-    # Stage 1: maximise priority-company boxes stored.
     c1 = np.zeros(N)
     for o in range(O):
-        c1[q0 + o * L:q0 + (o + 1) * L] = -orders.iloc[o].PRIORITY_WEIGHT
+        if orders.iloc[o].PRIORITY:
+            c1[q0 + o * L:q0 + (o + 1) * L] = -1.0
     r1 = run(c1)
     if r1.x is None:
         raise RuntimeError(f"MILP stage 1 failed: {r1.message}")
-    p_opt = round(float(sum(r1.x[q0 + o * L:q0 + (o + 1) * L].sum() * orders.iloc[o].PRIORITY_WEIGHT for o in range(O))), 6)
-    P = lil_matrix((1, N))
-    for o in range(O):
-        for l in range(L):
-            P[0, q0 + o * L + l] = orders.iloc[o].PRIORITY_WEIGHT
-    pcon = LinearConstraint(P.tocsr(), np.array([p_opt]), np.array([p_opt]))
+    priority_opt = round(float(-r1.fun), 6)
 
-    # Stage 2: maximise total boxes while preserving Stage 1.
-    c2 = np.zeros(N); c2[q0:q0 + O * L] = -1
+    P = lil_matrix((1, N), dtype=float)
+    for o in range(O):
+        if orders.iloc[o].PRIORITY:
+            for l in range(L):
+                P[0, q0 + o * L + l] = 1.0
+    pcon = LinearConstraint(P.tocsr(), np.array([priority_opt]), np.array([priority_opt]))
+
+    c2 = np.zeros(N)
+    c2[q0:q0 + O * L] = -1.0
     r2 = run(c2, [pcon])
     if r2.x is None:
         raise RuntimeError(f"MILP stage 2 failed: {r2.message}")
-    total_opt = round(float(r2.x[q0:q0 + O * L].sum()), 6)
-    T = lil_matrix((1, N)); T[0, q0:q0 + O * L] = 1
+    total_opt = round(float(-r2.fun), 6)
+
+    T = lil_matrix((1, N), dtype=float)
+    for j in range(O * L):
+        T[0, q0 + j] = 1.0
     tcon = LinearConstraint(T.tocsr(), np.array([total_opt]), np.array([total_opt]))
 
-    # Stage 3: minimise retrieval distance and order-location fragmentation.
-    dist = slots.DISTANCE_FROM_DOOR_M.to_numpy(float)
     c3 = np.zeros(N)
+    dist = slots.DISTANCE_FROM_DOOR_M.to_numpy(float)
     for o in range(O):
-        w = orders.iloc[o].PRIORITY_WEIGHT
-        c3[q0 + o * L:q0 + (o + 1) * L] = dist * w
-        c3[y0 + o * L:y0 + (o + 1) * L] = 8.0
+        c3[q0 + o * L:q0 + (o + 1) * L] = dist
     r3 = run(c3, [pcon, tcon])
     if r3.x is None:
         raise RuntimeError(f"MILP stage 3 failed: {r3.message}")
@@ -182,6 +177,7 @@ def solve_day(mto: pd.DataFrame, slots: pd.DataFrame, date, time_limit: float = 
             q = int(round(X[q0 + o * L + l]))
             if q:
                 alloc.append({
+                    "Date": date.date().isoformat(),
                     "INVOICE_ID": orders.iloc[o].INVOICE_ID,
                     "COMPANY_ID": orders.iloc[o].COMPANY_ID,
                     "BOXES_STORED": q,
@@ -189,40 +185,60 @@ def solve_day(mto: pd.DataFrame, slots: pd.DataFrame, date, time_limit: float = 
                     "X_M": slots.iloc[l].X_M,
                     "Y_M": slots.iloc[l].Y_M,
                     "DISTANCE_FROM_DOOR_M": slots.iloc[l].DISTANCE_FROM_DOOR_M,
-                    "PRIORITY_WEIGHT": orders.iloc[o].PRIORITY_WEIGHT,
+                    "PRIORITY": orders.iloc[o].PRIORITY,
+                    "DISTANCE_BOX_M": q * float(slots.iloc[l].DISTANCE_FROM_DOOR_M),
                 })
         h = int(round(X[h0 + o]))
         if h:
-            held.append({"INVOICE_ID": orders.iloc[o].INVOICE_ID, "COMPANY_ID": orders.iloc[o].COMPANY_ID, "BOXES_HELD": h, "PRIORITY_WEIGHT": orders.iloc[o].PRIORITY_WEIGHT})
+            held.append({
+                "Date": date.date().isoformat(),
+                "INVOICE_ID": orders.iloc[o].INVOICE_ID,
+                "COMPANY_ID": orders.iloc[o].COMPANY_ID,
+                "BOXES_HELD": h,
+                "PRIORITY": orders.iloc[o].PRIORITY,
+            })
 
     alloc = pd.DataFrame(alloc)
     held = pd.DataFrame(held)
     if alloc.empty:
-        alloc = pd.DataFrame(columns=["INVOICE_ID", "COMPANY_ID", "BOXES_STORED", "SLOT_ID", "X_M", "Y_M", "DISTANCE_FROM_DOOR_M", "PRIORITY_WEIGHT"])
+        alloc = pd.DataFrame(columns=["Date", "INVOICE_ID", "COMPANY_ID", "BOXES_STORED", "SLOT_ID", "X_M", "Y_M", "DISTANCE_FROM_DOOR_M", "PRIORITY", "DISTANCE_BOX_M"])
     if held.empty:
-        held = pd.DataFrame(columns=["INVOICE_ID", "COMPANY_ID", "BOXES_HELD", "PRIORITY_WEIGHT"])
+        held = pd.DataFrame(columns=["Date", "INVOICE_ID", "COMPANY_ID", "BOXES_HELD", "PRIORITY"])
 
     loc = alloc.groupby("SLOT_ID", as_index=False).agg(
-        BOXES_STORED=("BOXES_STORED", "sum"), ORDERS=("INVOICE_ID", "nunique"), COMPANIES=("COMPANY_ID", "nunique"), DISTANCE_FROM_DOOR_M=("DISTANCE_FROM_DOOR_M", "first")
+        BOXES_STORED=("BOXES_STORED", "sum"),
+        ORDERS=("INVOICE_ID", "nunique"),
+        COMPANIES=("COMPANY_ID", "nunique"),
+        DISTANCE_FROM_DOOR_M=("DISTANCE_FROM_DOOR_M", "first"),
     )
     if not loc.empty:
-        loc["UTILISATION_PCT"] = loc.BOXES_STORED / 32 * 100
+        loc["UTILISATION_PCT"] = loc.BOXES_STORED / BOXES_PER_PALLET * 100
 
-    order_skus = day.groupby("INVOICE_ID").ITEM_SIZE.agg(lambda s: ", ".join(sorted(set(s.astype(str))))).to_dict()
-    if not alloc.empty:
-        alloc["SKU_LIST_IN_ORDER"] = alloc.INVOICE_ID.map(order_skus)
+    stored = int(alloc.BOXES_STORED.sum())
+    held_boxes = int(held.BOXES_HELD.sum()) if not held.empty else 0
+    priority_required = int(orders.loc[orders.PRIORITY, "BOXES"].sum())
+    priority_stored = int(alloc.loc[alloc.PRIORITY, "BOXES_STORED"].sum()) if not alloc.empty else 0
+    total_distance = float(alloc.DISTANCE_BOX_M.sum()) if not alloc.empty else 0.0
 
     summary = {
         "Date": date.date().isoformat(),
         "Process4_pallet_positions": L,
         "MTO_boxes": int(day.BOXES.sum()),
-        "Required_pallet_equivalent": int(np.ceil(day.BOXES.sum() / 32)),
-        "Boxes_stored": int(alloc.BOXES_STORED.sum()),
-        "Boxes_held": int(held.BOXES_HELD.sum()) if not held.empty else 0,
-        "Storage_utilisation_pct": float(alloc.BOXES_STORED.sum() / (L * 32) * 100),
+        "Required_pallet_equivalent": int(np.ceil(day.BOXES.sum() / BOXES_PER_PALLET)),
+        "Boxes_stored": stored,
+        "Boxes_held": held_boxes,
+        "Unused_box_capacity": int(L * BOXES_PER_PALLET - stored),
+        "Storage_utilisation_pct": float(stored / (L * BOXES_PER_PALLET) * 100),
         "Used_pallet_positions": int(loc.shape[0]),
-        "Priority_boxes_stored": int(sum(r.BOXES_STORED for _, r in alloc.iterrows() if r.PRIORITY_WEIGHT > 1)),
-        "Status": r3.message,
+        "Priority_boxes_required": priority_required,
+        "Priority_boxes_stored": priority_stored,
+        "Priority_storage_rate_pct": float(priority_stored / priority_required * 100) if priority_required else 0.0,
+        "Held_rate_pct": float(held_boxes / day.BOXES.sum() * 100) if day.BOXES.sum() else 0.0,
+        "Total_Distance_Box_M": total_distance,
+        "Weighted_Avg_Distance_M": float(total_distance / stored) if stored else 0.0,
+        "Capacity_Gap_Pallets": max(int(np.ceil(day.BOXES.sum() / BOXES_PER_PALLET)) - L, 0),
+        "Overflow": int(np.ceil(day.BOXES.sum() / BOXES_PER_PALLET)) > L,
+        "Solver_status": r3.message,
     }
     return {
         "summary": summary,
@@ -232,6 +248,6 @@ def solve_day(mto: pd.DataFrame, slots: pd.DataFrame, date, time_limit: float = 
         "orders": orders,
         "company_master": cm,
         "sku_master": sku_master(d),
-        "candidate_groups": sku_cooccurrence(d),
+        "candidate_groups": sku_cooccurrence(d, 150),
         "solver_messages": [r1.message, r2.message, r3.message],
     }
